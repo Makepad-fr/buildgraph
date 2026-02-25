@@ -2,6 +2,7 @@ package buildkit
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -101,7 +102,9 @@ func (d *DirectDriver) Build(ctx context.Context, endpoint string, req backend.B
 	var cacheHits int
 	var cacheMisses int
 
-	group, groupCtx := errgroup.WithContext(ctx)
+	progressCtx, cancelProgress := context.WithCancel(ctx)
+	defer cancelProgress()
+	group, groupCtx := errgroup.WithContext(progressCtx)
 	group.Go(func() error {
 		for {
 			select {
@@ -138,11 +141,16 @@ func (d *DirectDriver) Build(ctx context.Context, endpoint string, req backend.B
 		}
 	})
 
-	response, err := client.Solve(ctx, nil, solveOpt, statusCh)
-	close(statusCh)
-	_ = group.Wait()
-	if err != nil {
-		return backend.BuildResult{}, fmt.Errorf("buildkit solve: %w", err)
+	response, solveErr := client.Solve(ctx, nil, solveOpt, statusCh)
+	// BuildKit closes statusCh itself; cancel progress context to ensure
+	// consumer goroutine exits even if the channel is not closed on error paths.
+	cancelProgress()
+	progressErr := group.Wait()
+	if progressErr != nil && !errors.Is(progressErr, context.Canceled) {
+		return backend.BuildResult{}, fmt.Errorf("consume build progress: %w", progressErr)
+	}
+	if solveErr != nil {
+		return backend.BuildResult{}, fmt.Errorf("buildkit solve: %w", solveErr)
 	}
 
 	digest := response.ExporterResponse["containerimage.digest"]

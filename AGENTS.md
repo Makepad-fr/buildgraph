@@ -17,3 +17,4 @@
 - 2026-02-25: Added auth/events/capabilities scaffolding for SaaS readiness with local-first defaults.
 - 2026-02-25: Added SQLite run/findings/build/event persistence in local state DB.
 - 2026-02-25: Added CI workflow with OS matrix unit tests and Linux BuildKit integration jobs.
+- 2026-02-25: Direct BuildKit progress channel is owned/closed by BuildKit client; do not close `SolveStatus` channel manually in driver code.
