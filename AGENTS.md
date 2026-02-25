@@ -20,3 +20,4 @@
 - 2026-02-25: Direct BuildKit progress channel is owned/closed by BuildKit client; do not close `SolveStatus` channel manually in driver code.
 - 2026-02-25: BuildKit local exporter must use `ExportEntry.OutputDir` (not `Attrs.dest`) to avoid \"output directory is required for local exporter\".
 - 2026-02-25: CI policy: run workflows only on pushes to `main` and pull requests targeting `main`.
+- 2026-02-25: Integration build fixtures must be deterministic and self-contained (no external digest dependency) to avoid flaky CI.

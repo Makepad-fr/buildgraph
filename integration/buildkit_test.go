@@ -23,13 +23,16 @@ func TestDirectBuildkitBuildLocalOutput(t *testing.T) {
 
 	_, err := be.Build(ctx, backend.BuildRequest{
 		ContextDir: fixtures,
-		Dockerfile: "Dockerfile.good",
+		Dockerfile: "Dockerfile.integration",
 		OutputMode: backend.OutputLocal,
 		LocalDest:  outDir,
 		Endpoint:   endpoint,
 	}, nil)
 	if err != nil {
 		t.Fatalf("build failed: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(outDir, "hello.txt")); err != nil {
+		t.Fatalf("expected exported file hello.txt: %v", err)
 	}
 }
 
@@ -44,7 +47,7 @@ func TestDockerBackedBuildImageOutput(t *testing.T) {
 
 	_, err := be.Build(ctx, backend.BuildRequest{
 		ContextDir: fixtures,
-		Dockerfile: "Dockerfile.good",
+		Dockerfile: "Dockerfile.integration",
 		OutputMode: backend.OutputImage,
 		ImageRef:   "buildgraph/integration:test",
 	}, nil)
