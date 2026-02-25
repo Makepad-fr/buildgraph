@@ -1,0 +1,58 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  unit:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.x'
+
+      - name: Download modules
+        run: go mod download
+
+      - name: Test
+        run: go test ./...
+
+  integration-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.x'
+
+      - name: Start buildkitd
+        run: |
+          docker run -d --name buildkitd --privileged -p 1234:1234 moby/buildkit:v0.27.1 --addr tcp://0.0.0.0:1234
+          for i in $(seq 1 20); do
+            if docker logs buildkitd 2>&1 | grep -q "running server"; then
+              exit 0
+            fi
+            sleep 1
+          done
+          docker logs buildkitd
+          exit 1
+
+      - name: Direct BuildKit integration tests
+        env:
+          BUILDGRAPH_INTEGRATION_DIRECT_ENDPOINT: tcp://127.0.0.1:1234
+        run: go test ./integration -run TestDirectBuildkitBuildLocalOutput -v
+
+      - name: Docker-backed integration tests
+        env:
+          BUILDGRAPH_INTEGRATION_DOCKER: '1'
+        run: go test ./integration -run TestDockerBackedBuildImageOutput -v
