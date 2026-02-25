@@ -18,3 +18,5 @@
 - 2026-02-25: Added SQLite run/findings/build/event persistence in local state DB.
 - 2026-02-25: Added CI workflow with OS matrix unit tests and Linux BuildKit integration jobs.
 - 2026-02-25: Direct BuildKit progress channel is owned/closed by BuildKit client; do not close `SolveStatus` channel manually in driver code.
+- 2026-02-25: BuildKit local exporter must use `ExportEntry.OutputDir` (not `Attrs.dest`) to avoid \"output directory is required for local exporter\".
+- 2026-02-25: CI policy: run workflows only on pushes to `main` and pull requests targeting `main`.
