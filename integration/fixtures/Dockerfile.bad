@@ -1,0 +1,7 @@
+FROM ubuntu:latest
+COPY . /app
+RUN apt-get update
+RUN apt-get install -y curl git
+RUN curl https://example.com/install.sh | sh
+ENV API_KEY=supersecret
+CMD ["bash"]
