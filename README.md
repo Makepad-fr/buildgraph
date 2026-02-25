@@ -15,6 +15,36 @@
 go build ./cmd/buildgraph
 ```
 
+## Download Prebuilt Binaries
+
+Artifacts are published automatically for every GitHub release.
+
+### Linux (amd64)
+
+```bash
+curl -sSfL -o buildgraph_linux_amd64.tar.gz \
+  https://github.com/Makepad-fr/buildgraph/releases/latest/download/buildgraph_linux_amd64.tar.gz
+tar -xzf buildgraph_linux_amd64.tar.gz
+sudo install -m 0755 buildgraph /usr/local/bin/buildgraph
+```
+
+### macOS (amd64)
+
+```bash
+curl -sSfL -o buildgraph_darwin_amd64.tar.gz \
+  https://github.com/Makepad-fr/buildgraph/releases/latest/download/buildgraph_darwin_amd64.tar.gz
+tar -xzf buildgraph_darwin_amd64.tar.gz
+chmod +x buildgraph
+mv buildgraph /usr/local/bin/buildgraph
+```
+
+### Windows (amd64)
+
+```powershell
+Invoke-WebRequest -Uri "https://github.com/Makepad-fr/buildgraph/releases/latest/download/buildgraph_windows_amd64.zip" -OutFile "buildgraph_windows_amd64.zip"
+Expand-Archive -Path ".\\buildgraph_windows_amd64.zip" -DestinationPath ".\\buildgraph"
+```
+
 ## Commands
 
 ```bash

@@ -21,3 +21,5 @@
 - 2026-02-25: BuildKit local exporter must use `ExportEntry.OutputDir` (not `Attrs.dest`) to avoid \"output directory is required for local exporter\".
 - 2026-02-25: CI policy: run workflows only on pushes to `main` and pull requests targeting `main`.
 - 2026-02-25: Integration build fixtures must be deterministic and self-contained (no external digest dependency) to avoid flaky CI.
+- 2026-02-25: Repository metadata is managed with GitHub CLI (`gh`) and should include concise description + discoverable topics.
+- 2026-02-25: Public release policy: publish prebuilt CLI artifacts for Linux/macOS/Windows on each published GitHub release.
