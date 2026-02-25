@@ -207,10 +207,8 @@ func configureExports(solveOpt *bkclient.SolveOpt, req backend.BuildRequest) ([]
 			return nil, nil, fmt.Errorf("create local destination: %w", err)
 		}
 		solveOpt.Exports = []bkclient.ExportEntry{{
-			Type: bkclient.ExporterLocal,
-			Attrs: map[string]string{
-				"dest": req.LocalDest,
-			},
+			Type:      bkclient.ExporterLocal,
+			OutputDir: req.LocalDest,
 		}}
 		return []string{req.LocalDest}, nil, nil
 	default:
