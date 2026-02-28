@@ -4,9 +4,11 @@ import (
 	"archive/tar"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -14,9 +16,11 @@ import (
 
 	"github.com/Makepad-fr/buildgraph/internal/backend"
 	ctrplatforms "github.com/containerd/platforms"
+	bksession "github.com/moby/buildkit/session"
 	buildtypes "github.com/moby/moby/api/types/build"
 	dockerclient "github.com/moby/moby/client"
 	specs "github.com/opencontainers/image-spec/specs-go/v1"
+	"golang.org/x/sync/errgroup"
 )
 
 type DockerDriver struct{}
@@ -96,6 +100,13 @@ func (d *DockerDriver) Build(ctx context.Context, req backend.BuildRequest, prog
 		Version:    buildtypes.BuilderBuildKit,
 		Remove:     true,
 	}
+	session, err := startDockerBuildSession(ctx, cli)
+	if err != nil {
+		return backend.BuildResult{}, err
+	}
+	defer session.Close()
+	options.SessionID = session.ID()
+
 	if len(req.Platforms) > 0 {
 		options.Platforms = make([]specs.Platform, 0, len(req.Platforms))
 		for _, platform := range req.Platforms {
@@ -221,4 +232,61 @@ func tarContextDirectory(root string) (io.ReadCloser, error) {
 	}()
 
 	return pr, nil
+}
+
+type dockerBuildSession struct {
+	session *bksession.Session
+	cancel  context.CancelFunc
+	group   *errgroup.Group
+}
+
+func startDockerBuildSession(ctx context.Context, cli *dockerclient.Client) (*dockerBuildSession, error) {
+	// BuildKit frontend resolution on the daemon expects a live session; wire it
+	// through Docker's /session hijack endpoint.
+	session, err := bksession.NewSession(ctx, "buildgraph")
+	if err != nil {
+		return nil, fmt.Errorf("create docker build session: %w", err)
+	}
+	runCtx, cancel := context.WithCancel(ctx)
+	group, groupCtx := errgroup.WithContext(runCtx)
+	group.Go(func() error {
+		return session.Run(groupCtx, func(ctx context.Context, proto string, meta map[string][]string) (net.Conn, error) {
+			return cli.DialHijack(ctx, "/session", proto, meta)
+		})
+	})
+	return &dockerBuildSession{
+		session: session,
+		cancel:  cancel,
+		group:   group,
+	}, nil
+}
+
+func (s *dockerBuildSession) ID() string {
+	if s == nil || s.session == nil {
+		return ""
+	}
+	return s.session.ID()
+}
+
+func (s *dockerBuildSession) Close() error {
+	if s == nil {
+		return nil
+	}
+	if s.cancel != nil {
+		s.cancel()
+	}
+	if s.session != nil {
+		_ = s.session.Close()
+	}
+	if s.group == nil {
+		return nil
+	}
+	err := s.group.Wait()
+	if err == nil {
+		return nil
+	}
+	if errors.Is(err, context.Canceled) {
+		return nil
+	}
+	return err
 }
