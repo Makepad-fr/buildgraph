@@ -32,3 +32,40 @@ func TestParseGlobalFlagsFromCommandTail(t *testing.T) {
 		t.Fatalf("unexpected remaining args: %v", remaining)
 	}
 }
+
+func TestNormalizeProgressMode(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name       string
+		value      string
+		globalJSON bool
+		want       string
+		wantErr    bool
+	}{
+		{name: "auto human", value: "auto", globalJSON: false, want: "human"},
+		{name: "auto json", value: "auto", globalJSON: true, want: "none"},
+		{name: "explicit json", value: "json", globalJSON: false, want: "json"},
+		{name: "invalid", value: "wat", globalJSON: false, wantErr: true},
+	}
+
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			got, err := normalizeProgressMode(tc.value, tc.globalJSON)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("expected error")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("normalize progress mode: %v", err)
+			}
+			if got != tc.want {
+				t.Fatalf("unexpected mode: got=%q want=%q", got, tc.want)
+			}
+		})
+	}
+}

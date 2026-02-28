@@ -16,8 +16,18 @@ const BackendName = "buildkit"
 
 type Backend struct {
 	analyzer *analyze.Engine
-	direct   *DirectDriver
-	docker   *DockerDriver
+	direct   directClient
+	docker   dockerClient
+}
+
+type directClient interface {
+	Ping(ctx context.Context, endpoint string) error
+	Build(ctx context.Context, endpoint string, req backend.BuildRequest, progress backend.BuildProgressFunc) (backend.BuildResult, error)
+}
+
+type dockerClient interface {
+	Ping(ctx context.Context) error
+	Build(ctx context.Context, req backend.BuildRequest, progress backend.BuildProgressFunc) (backend.BuildResult, error)
 }
 
 func NewBackend() *Backend {
@@ -41,6 +51,8 @@ func (b *Backend) Detect(ctx context.Context, req backend.DetectRequest) (backen
 			Available: false,
 			Mode:      "none",
 			Details:   err.Error(),
+			Attempts:  resolved.Attempts,
+			Metadata:  map[string]string{},
 		}, err
 	}
 
@@ -50,6 +62,7 @@ func (b *Backend) Detect(ctx context.Context, req backend.DetectRequest) (backen
 		Mode:      resolved.Mode,
 		Available: true,
 		Details:   resolved.Details,
+		Attempts:  resolved.Attempts,
 		Metadata: map[string]string{
 			"resolutionSource": resolved.Source,
 		},
@@ -135,54 +148,101 @@ type endpointResolution struct {
 	Mode     string
 	Source   string
 	Details  string
+	Attempts []backend.DetectAttempt
 }
 
 func (b *Backend) resolveEndpoint(ctx context.Context, explicit, projectConfigPath, globalConfigPath string) (endpointResolution, error) {
-	if endpoint := strings.TrimSpace(explicit); endpoint != "" {
-		if err := b.direct.Ping(ctx, endpoint); err == nil {
-			return endpointResolution{Endpoint: endpoint, Mode: "direct", Source: "flag", Details: "using explicit BuildKit endpoint"}, nil
+	attempts := make([]backend.DetectAttempt, 0, 8)
+
+	tryDirect := func(source, endpoint, details string) (endpointResolution, bool) {
+		endpoint = strings.TrimSpace(endpoint)
+		if endpoint == "" {
+			return endpointResolution{}, false
 		}
+		attempt := backend.DetectAttempt{
+			Source:   source,
+			Endpoint: endpoint,
+			Mode:     "direct",
+			Details:  details,
+		}
+		if err := b.direct.Ping(ctx, endpoint); err != nil {
+			attempt.Status = "error"
+			attempt.Error = err.Error()
+			attempts = append(attempts, attempt)
+			return endpointResolution{}, false
+		}
+		attempt.Status = "ok"
+		attempts = append(attempts, attempt)
+		return endpointResolution{
+			Endpoint: endpoint,
+			Mode:     "direct",
+			Source:   source,
+			Details:  details,
+			Attempts: attempts,
+		}, true
 	}
 
-	if endpoint := strings.TrimSpace(os.Getenv("BUILDKIT_HOST")); endpoint != "" {
-		if err := b.direct.Ping(ctx, endpoint); err == nil {
-			return endpointResolution{Endpoint: endpoint, Mode: "direct", Source: "env", Details: "using BUILDKIT_HOST"}, nil
+	tryDocker := func(source, details string) (endpointResolution, bool) {
+		attempt := backend.DetectAttempt{
+			Source:   source,
+			Endpoint: "docker://local",
+			Mode:     "docker",
+			Details:  details,
 		}
+		if err := b.docker.Ping(ctx); err != nil {
+			attempt.Status = "error"
+			attempt.Error = err.Error()
+			attempts = append(attempts, attempt)
+			return endpointResolution{}, false
+		}
+		attempt.Status = "ok"
+		attempts = append(attempts, attempt)
+		return endpointResolution{
+			Endpoint: "docker://local",
+			Mode:     "docker",
+			Source:   source,
+			Details:  details,
+			Attempts: attempts,
+		}, true
 	}
 
-	if endpoint := readEndpointFromConfig(projectConfigPath); endpoint != "" {
-		if err := b.direct.Ping(ctx, endpoint); err == nil {
-			return endpointResolution{Endpoint: endpoint, Mode: "direct", Source: "project-config", Details: "using project config endpoint"}, nil
-		}
+	if resolved, ok := tryDirect("flag", explicit, "using explicit BuildKit endpoint"); ok {
+		return resolved, nil
 	}
-	if endpoint := readEndpointFromConfig(globalConfigPath); endpoint != "" {
-		if err := b.direct.Ping(ctx, endpoint); err == nil {
-			return endpointResolution{Endpoint: endpoint, Mode: "direct", Source: "global-config", Details: "using global config endpoint"}, nil
-		}
+
+	if resolved, ok := tryDirect("env", os.Getenv("BUILDKIT_HOST"), "using BUILDKIT_HOST"); ok {
+		return resolved, nil
+	}
+
+	if resolved, ok := tryDirect("project-config", readEndpointFromConfig(projectConfigPath), "using project config endpoint"); ok {
+		return resolved, nil
+	}
+	if resolved, ok := tryDirect("global-config", readEndpointFromConfig(globalConfigPath), "using global config endpoint"); ok {
+		return resolved, nil
 	}
 
 	if runtime.GOOS == "windows" {
-		if err := b.docker.Ping(ctx); err == nil {
-			return endpointResolution{Endpoint: "docker://local", Mode: "docker", Source: "auto", Details: "docker daemon reachable"}, nil
+		if resolved, ok := tryDocker("auto", "docker daemon reachable"); ok {
+			return resolved, nil
 		}
 		for _, endpoint := range windowsDefaultEndpoints() {
-			if err := b.direct.Ping(ctx, endpoint); err == nil {
-				return endpointResolution{Endpoint: endpoint, Mode: "direct", Source: "auto", Details: "direct BuildKit endpoint discovered"}, nil
+			if resolved, ok := tryDirect("auto", endpoint, "direct BuildKit endpoint discovered"); ok {
+				return resolved, nil
 			}
 		}
-		return endpointResolution{}, fmt.Errorf("no BuildKit endpoint detected on Windows: docker daemon unavailable and no direct endpoint reachable")
+		return endpointResolution{Attempts: attempts}, fmt.Errorf("no BuildKit endpoint detected on Windows: docker daemon unavailable and no direct endpoint reachable")
 	}
 
 	for _, endpoint := range unixDefaultEndpoints() {
-		if err := b.direct.Ping(ctx, endpoint); err == nil {
-			return endpointResolution{Endpoint: endpoint, Mode: "direct", Source: "auto", Details: "direct BuildKit endpoint discovered"}, nil
+		if resolved, ok := tryDirect("auto", endpoint, "direct BuildKit endpoint discovered"); ok {
+			return resolved, nil
 		}
 	}
-	if err := b.docker.Ping(ctx); err == nil {
-		return endpointResolution{Endpoint: "docker://local", Mode: "docker", Source: "auto", Details: "docker daemon reachable"}, nil
+	if resolved, ok := tryDocker("auto", "docker daemon reachable"); ok {
+		return resolved, nil
 	}
 
-	return endpointResolution{}, fmt.Errorf("no BuildKit endpoint detected")
+	return endpointResolution{Attempts: attempts}, fmt.Errorf("no BuildKit endpoint detected")
 }
 
 func readEndpointFromConfig(path string) string {

@@ -20,6 +20,7 @@ import (
 	"github.com/Makepad-fr/buildgraph/internal/platform/capabilities"
 	"github.com/Makepad-fr/buildgraph/internal/platform/events"
 	"github.com/Makepad-fr/buildgraph/internal/state"
+	"github.com/Makepad-fr/buildgraph/internal/trace"
 	"github.com/Makepad-fr/buildgraph/internal/version"
 )
 
@@ -123,6 +124,10 @@ func (a *App) Run(ctx context.Context, args []string) int {
 		}
 	case "backend":
 		exitCode, runErr = a.runBackend(global, cmdArgs)
+	case "graph":
+		exitCode, runErr = a.runGraph(global, cmdArgs)
+	case "top":
+		exitCode, runErr = a.runTop(global, cmdArgs)
 	case "doctor":
 		exitCode, runErr = a.runDoctor(ctx, global, loadedCfg, stateStore)
 	case "auth":
@@ -166,6 +171,8 @@ func (a *App) Run(ctx context.Context, args []string) int {
 }
 
 func (a *App) runAnalyze(ctx context.Context, global GlobalOptions, loaded config.Loaded, args []string) (backend.AnalyzeResult, []backend.Finding, int, error) {
+	startedAt := time.Now().UTC()
+
 	allowed, err := a.capabilities.Has(ctx, capabilities.FeatureAnalyze)
 	if err != nil {
 		return backend.AnalyzeResult{}, nil, ExitAuthDenied, err
@@ -212,19 +219,17 @@ func (a *App) runAnalyze(ctx context.Context, global GlobalOptions, loaded confi
 	failErr := fmt.Errorf("analysis found violations matching fail-on=%s", *failOn)
 
 	if global.JSON {
-		env := output.Envelope{
-			APIVersion: output.APIVersion,
-			Command:    "analyze",
-			Timestamp:  time.Now().UTC(),
-			DurationMS: 0,
-			Result:     result,
-		}
+		errors := []output.ErrorItem{}
 		if failure {
-			env.Errors = []output.ErrorItem{{Code: "violation", Message: failErr.Error()}}
+			errors = append(errors, output.ErrorItem{Code: "violation", Message: failErr.Error()})
 		}
-		_ = output.WriteJSON(a.io.Out, env)
+		if err := output.WriteJSON(a.io.Out, output.NewEnvelope("analyze", startedAt, result, errors)); err != nil {
+			return backend.AnalyzeResult{}, nil, ExitInternal, err
+		}
 	} else {
-		_ = output.WriteAnalyze(a.io.Out, result)
+		if err := output.WriteAnalyze(a.io.Out, result); err != nil {
+			return backend.AnalyzeResult{}, nil, ExitInternal, err
+		}
 	}
 
 	if failure {
@@ -238,6 +243,8 @@ func (a *App) runAnalyze(ctx context.Context, global GlobalOptions, loaded confi
 }
 
 func (a *App) runBuild(ctx context.Context, global GlobalOptions, loaded config.Loaded, args []string) (*backend.BuildResult, int, error) {
+	startedAt := time.Now().UTC()
+
 	allowed, err := a.capabilities.Has(ctx, capabilities.FeatureBuild)
 	if err != nil {
 		return nil, ExitAuthDenied, err
@@ -261,6 +268,8 @@ func (a *App) runBuild(ctx context.Context, global GlobalOptions, loaded config.
 	localDest := fs.String("local-dest", "", "Destination directory for local output")
 	backendName := fs.String("backend", loaded.Config.Backend, "Backend selector")
 	endpoint := fs.String("endpoint", loaded.Config.Endpoint, "BuildKit endpoint")
+	progressModeRaw := fs.String("progress", "auto", "Progress mode: human|json|none")
+	tracePath := fs.String("trace", "", "Write build trace to JSONL path")
 
 	fs.Var(&platforms, "platform", "Target platform (repeatable)")
 	fs.Var(&buildArgs, "build-arg", "Build arg key=value (repeatable)")
@@ -275,11 +284,41 @@ func (a *App) runBuild(ctx context.Context, global GlobalOptions, loaded config.
 		return nil, ExitBackend, err
 	}
 
-	progress := func(event backend.BuildProgressEvent) {
-		if global.JSON {
-			return
+	progressMode, err := normalizeProgressMode(*progressModeRaw, global.JSON)
+	if err != nil {
+		return nil, ExitUsage, err
+	}
+
+	var traceFile io.Closer
+	var traceWriter *trace.Writer
+	if path := strings.TrimSpace(*tracePath); path != "" {
+		file, writer, err := trace.OpenFileWriter(path)
+		if err != nil {
+			return nil, ExitConfigState, err
 		}
-		fmt.Fprintf(a.io.Err, "[%s] %s\n", event.Phase, strings.TrimSpace(event.Message))
+		traceFile = file
+		traceWriter = writer
+		defer traceFile.Close()
+	}
+
+	var stderrTraceWriter *trace.Writer
+	if progressMode == "json" {
+		stderrTraceWriter = trace.NewWriter(a.io.Err)
+	}
+
+	progress := func(event backend.BuildProgressEvent) {
+		record := trace.ProgressRecord("build", event)
+		if traceWriter != nil {
+			_ = traceWriter.WriteRecord(record)
+		}
+		switch progressMode {
+		case "human":
+			fmt.Fprintf(a.io.Err, "[%s] %s\n", event.Phase, strings.TrimSpace(event.Message))
+		case "json":
+			if stderrTraceWriter != nil {
+				_ = stderrTraceWriter.WriteRecord(record)
+			}
+		}
 	}
 
 	result, err := selectedBackend.Build(ctx, backend.BuildRequest{
@@ -299,24 +338,30 @@ func (a *App) runBuild(ctx context.Context, global GlobalOptions, loaded config.
 		GlobalConfigPath:  loaded.Paths.GlobalPath,
 	}, progress)
 	if err != nil {
+		if traceWriter != nil {
+			_ = traceWriter.WriteRecord(trace.FailureRecord("build", "build_failed", err.Error()))
+		}
 		return nil, ExitBuildFailed, err
+	}
+	if traceWriter != nil {
+		_ = traceWriter.WriteRecord(trace.ResultRecord("build", result))
 	}
 
 	if global.JSON {
-		_ = output.WriteJSON(a.io.Out, output.Envelope{
-			APIVersion: output.APIVersion,
-			Command:    "build",
-			Timestamp:  time.Now().UTC(),
-			DurationMS: 0,
-			Result:     result,
-		})
+		if err := output.WriteJSON(a.io.Out, output.NewEnvelope("build", startedAt, result, nil)); err != nil {
+			return nil, ExitInternal, err
+		}
 	} else {
-		_ = output.WriteBuild(a.io.Out, result)
+		if err := output.WriteBuild(a.io.Out, result); err != nil {
+			return nil, ExitInternal, err
+		}
 	}
 	return &result, ExitOK, nil
 }
 
 func (a *App) runBackend(global GlobalOptions, args []string) (int, error) {
+	startedAt := time.Now().UTC()
+
 	if len(args) == 0 {
 		return ExitUsage, fmt.Errorf("backend subcommand is required")
 	}
@@ -325,15 +370,9 @@ func (a *App) runBackend(global GlobalOptions, args []string) (int, error) {
 	}
 	names := a.registry.List()
 	if global.JSON {
-		return ExitOK, output.WriteJSON(a.io.Out, output.Envelope{
-			APIVersion: output.APIVersion,
-			Command:    "backend list",
-			Timestamp:  time.Now().UTC(),
-			DurationMS: 0,
-			Result: map[string]any{
-				"backends": names,
-			},
-		})
+		return ExitOK, output.WriteJSON(a.io.Out, output.NewEnvelope("backend list", startedAt, map[string]any{
+			"backends": names,
+		}, nil))
 	}
 	for _, name := range names {
 		fmt.Fprintln(a.io.Out, name)
@@ -342,64 +381,82 @@ func (a *App) runBackend(global GlobalOptions, args []string) (int, error) {
 }
 
 func (a *App) runDoctor(ctx context.Context, global GlobalOptions, loaded config.Loaded, store *state.Store) (int, error) {
+	startedAt := time.Now().UTC()
+
 	checks := map[string]string{
 		"config.global":  status(loaded.Paths.GlobalExists, loaded.Paths.GlobalPath),
 		"config.project": status(loaded.Paths.ProjectExists, loaded.Paths.ProjectPath),
 	}
+	hasError := false
 	if store != nil {
 		checks["state.sqlite"] = "ok: " + store.Path()
 	} else {
 		checks["state.sqlite"] = "error: unavailable"
+		hasError = true
+	}
+
+	detect := backend.DetectResult{
+		Backend:  buildkit.BackendName,
+		Mode:     "none",
+		Details:  "backend detection was not executed",
+		Metadata: map[string]string{},
 	}
 
 	selectedBackend, err := a.resolveBackend(loaded.Config.Backend)
 	if err != nil {
 		checks["backend.detect"] = "error: " + err.Error()
+		detect.Details = err.Error()
+		hasError = true
 	} else {
-		detect, detectErr := selectedBackend.Detect(ctx, backend.DetectRequest{
+		detect, err = selectedBackend.Detect(ctx, backend.DetectRequest{
 			Backend:           loaded.Config.Backend,
 			Endpoint:          loaded.Config.Endpoint,
 			ProjectConfigPath: loaded.Paths.ProjectPath,
 			GlobalConfigPath:  loaded.Paths.GlobalPath,
 		})
-		if detectErr != nil {
-			checks["backend.detect"] = "error: " + detectErr.Error()
+		if err != nil {
+			checks["backend.detect"] = "error: " + err.Error()
+			hasError = true
 		} else {
 			checks["backend.detect"] = fmt.Sprintf("ok: mode=%s endpoint=%s", detect.Mode, detect.Endpoint)
 		}
 	}
 
+	report := output.DoctorReport{
+		Checks:        checks,
+		Attempts:      detect.Attempts,
+		Found:         detect,
+		ConfigSnippet: doctorConfigSnippet(loaded.Config.Endpoint, detect.Endpoint),
+		CommonFixes:   doctorCommonFixes(loaded.Config.Endpoint, detect),
+	}
+
 	if global.JSON {
-		if err := output.WriteJSON(a.io.Out, output.Envelope{
-			APIVersion: output.APIVersion,
-			Command:    "doctor",
-			Timestamp:  time.Now().UTC(),
-			DurationMS: 0,
-			Result: map[string]any{
-				"checks": checks,
-			},
-		}); err != nil {
+		errors := []output.ErrorItem{}
+		if hasError {
+			errors = append(errors, output.ErrorItem{Code: "doctor_failed", Message: "doctor detected failing checks"})
+		}
+		if err := output.WriteJSON(a.io.Out, output.NewEnvelope("doctor", startedAt, report, errors)); err != nil {
 			return ExitInternal, err
 		}
 	} else {
-		if err := output.WriteDoctor(a.io.Out, checks); err != nil {
+		if err := output.WriteDoctor(a.io.Out, report); err != nil {
 			return ExitInternal, err
 		}
 	}
 
-	for _, value := range checks {
-		if strings.HasPrefix(value, "error:") {
-			err := fmt.Errorf("doctor detected failing checks")
-			if global.JSON {
-				return ExitBackend, markReportedError(err)
-			}
-			return ExitBackend, err
+	if hasError {
+		err := fmt.Errorf("doctor detected failing checks")
+		if global.JSON {
+			return ExitBackend, markReportedError(err)
 		}
+		return ExitBackend, err
 	}
 	return ExitOK, nil
 }
 
 func (a *App) runAuth(global GlobalOptions, args []string) (int, error) {
+	startedAt := time.Now().UTC()
+
 	if len(args) == 0 {
 		return ExitUsage, fmt.Errorf("auth subcommand is required")
 	}
@@ -426,35 +483,31 @@ func (a *App) runAuth(global GlobalOptions, args []string) (int, error) {
 		if err := manager.Save(auth.Credentials{User: *user, Token: *token}); err != nil {
 			return ExitConfigState, err
 		}
-		return a.writeSimple(global.JSON, "auth login", map[string]any{"status": "logged-in", "user": *user})
+		return a.writeSimple(global.JSON, "auth login", startedAt, map[string]any{"status": "logged-in", "user": *user})
 	case "logout":
 		if err := manager.Delete(); err != nil {
 			return ExitConfigState, err
 		}
-		return a.writeSimple(global.JSON, "auth logout", map[string]any{"status": "logged-out"})
+		return a.writeSimple(global.JSON, "auth logout", startedAt, map[string]any{"status": "logged-out"})
 	case "whoami":
 		creds, err := manager.Load()
 		if err != nil {
 			return ExitAuthDenied, fmt.Errorf("not logged in")
 		}
-		return a.writeSimple(global.JSON, "auth whoami", map[string]any{"user": creds.User, "source": creds.Source, "storedAt": creds.StoredAt})
+		return a.writeSimple(global.JSON, "auth whoami", startedAt, map[string]any{"user": creds.User, "source": creds.Source, "storedAt": creds.StoredAt})
 	default:
 		return ExitUsage, fmt.Errorf("unsupported auth subcommand %q", subcommand)
 	}
 }
 
 func (a *App) runConfig(global GlobalOptions, loaded config.Loaded, args []string) (int, error) {
+	startedAt := time.Now().UTC()
+
 	if len(args) == 0 || args[0] != "show" {
 		return ExitUsage, fmt.Errorf("supported config command: show")
 	}
 	if global.JSON {
-		return ExitOK, output.WriteJSON(a.io.Out, output.Envelope{
-			APIVersion: output.APIVersion,
-			Command:    "config show",
-			Timestamp:  time.Now().UTC(),
-			DurationMS: 0,
-			Result:     loaded,
-		})
+		return ExitOK, output.WriteJSON(a.io.Out, output.NewEnvelope("config show", startedAt, loaded, nil))
 	}
 
 	fmt.Fprintf(a.io.Out, "Global config: %s\n", loaded.Paths.GlobalPath)
@@ -466,23 +519,19 @@ func (a *App) runConfig(global GlobalOptions, loaded config.Loaded, args []strin
 }
 
 func (a *App) runVersion(global GlobalOptions) (int, error) {
+	startedAt := time.Now().UTC()
+
 	payload := map[string]any{
 		"version":   version.Version,
 		"commit":    version.Commit,
 		"buildDate": version.BuildDate,
 	}
-	return a.writeSimple(global.JSON, "version", payload)
+	return a.writeSimple(global.JSON, "version", startedAt, payload)
 }
 
-func (a *App) writeSimple(asJSON bool, command string, result any) (int, error) {
+func (a *App) writeSimple(asJSON bool, command string, startedAt time.Time, result any) (int, error) {
 	if asJSON {
-		if err := output.WriteJSON(a.io.Out, output.Envelope{
-			APIVersion: output.APIVersion,
-			Command:    command,
-			Timestamp:  time.Now().UTC(),
-			DurationMS: 0,
-			Result:     result,
-		}); err != nil {
+		if err := output.WriteJSON(a.io.Out, output.NewEnvelope(command, startedAt, result, nil)); err != nil {
 			return ExitInternal, err
 		}
 	} else {
@@ -679,6 +728,54 @@ func status(ok bool, detail string) string {
 	return "missing: " + detail
 }
 
+func normalizeProgressMode(value string, globalJSON bool) (string, error) {
+	mode := strings.ToLower(strings.TrimSpace(value))
+	switch mode {
+	case "", "auto":
+		if globalJSON {
+			return "none", nil
+		}
+		return "human", nil
+	case "human", "json", "none":
+		return mode, nil
+	default:
+		return "", fmt.Errorf("invalid --progress %q (expected human|json|none)", value)
+	}
+}
+
+func doctorConfigSnippet(configEndpoint, detectedEndpoint string) string {
+	endpoint := strings.TrimSpace(detectedEndpoint)
+	if endpoint == "" {
+		endpoint = strings.TrimSpace(configEndpoint)
+	}
+	if endpoint == "" {
+		endpoint = "unix:///run/buildkit/buildkitd.sock"
+	}
+	return fmt.Sprintf("backend: buildkit\nendpoint: %q\n", endpoint)
+}
+
+func doctorCommonFixes(configEndpoint string, detect backend.DetectResult) []string {
+	fixes := []string{
+		"If using a direct BuildKit socket, verify buildkitd is running and your user can access the socket path.",
+		"If using Docker Desktop/Engine, confirm the daemon is reachable and the active Docker context matches your expected environment.",
+		"If endpoint detection is wrong, pin backend and endpoint in .buildgraph.yaml to avoid ambiguous auto-detection.",
+	}
+
+	if strings.TrimSpace(configEndpoint) != "" {
+		fixes = append(fixes, fmt.Sprintf("Configured endpoint is %q; remove conflicting BUILDGRAPH_ENDPOINT or BUILDKIT_HOST values if they should not override config.", configEndpoint))
+	}
+	if source := detect.Metadata["resolutionSource"]; source == "env" {
+		fixes = append(fixes, "Detection resolved from environment; clear BUILDKIT_HOST if this endpoint is stale.")
+	}
+	for _, attempt := range detect.Attempts {
+		if strings.Contains(strings.ToLower(attempt.Error), "permission denied") {
+			fixes = append(fixes, "Permission denied was reported while probing BuildKit. Add your user to the required group or adjust socket ACLs.")
+			break
+		}
+	}
+	return fixes
+}
+
 type stringSliceFlag []string
 
 func (s *stringSliceFlag) String() string {
@@ -751,16 +848,10 @@ func (a *App) writeError(asJSON bool, command string, durationMs int64, err erro
 		return
 	}
 	if asJSON {
-		_ = output.WriteJSON(a.io.Err, output.Envelope{
-			APIVersion: output.APIVersion,
-			Command:    command,
-			Timestamp:  time.Now().UTC(),
-			DurationMS: durationMs,
-			Errors: []output.ErrorItem{{
-				Code:    "error",
-				Message: err.Error(),
-			}},
-		})
+		_ = output.WriteJSON(a.io.Err, output.NewEnvelopeWithDuration(command, durationMs, nil, []output.ErrorItem{{
+			Code:    "error",
+			Message: err.Error(),
+		}}))
 		return
 	}
 	fmt.Fprintf(a.io.Err, "Error: %v\n", err)
@@ -774,7 +865,9 @@ func (a *App) printHelp(w io.Writer) {
 	fmt.Fprintln(w, "")
 	fmt.Fprintln(w, "Commands:")
 	fmt.Fprintln(w, "  analyze       Analyze Dockerfile and build context")
-	fmt.Fprintln(w, "  build         Execute BuildKit build")
+	fmt.Fprintln(w, "  build         Execute BuildKit build (--progress, --trace)")
+	fmt.Fprintln(w, "  graph         Build graph artifact from trace (--from, --format, --output)")
+	fmt.Fprintln(w, "  top           Show slowest vertices and critical path from trace")
 	fmt.Fprintln(w, "  backend list  List available backends")
 	fmt.Fprintln(w, "  doctor        Run environment diagnostics")
 	fmt.Fprintln(w, "  auth          Manage SaaS authentication state")
