@@ -23,3 +23,7 @@
 - 2026-02-25: Integration build fixtures must be deterministic and self-contained (no external digest dependency) to avoid flaky CI.
 - 2026-02-25: Repository metadata is managed with GitHub CLI (`gh`) and should include concise description + discoverable topics.
 - 2026-02-25: Public release policy: publish prebuilt CLI artifacts for Linux/macOS/Windows on each published GitHub release.
+- 2026-02-26: Added first-class build trace + graph workflows (`build --progress/--trace`, `graph --from`, `top --from`) powered by local JSONL trace artifacts.
+- 2026-02-26: Formalized stable JSON envelope contract with `schemaVersion` and always-present `errors` array.
+- 2026-02-26: Doctor UX now includes attempt trail, resolved backend details, paste-ready config snippet, and remediation guidance.
+- 2026-02-26: Minimum required Go version is Go 1.26 for local builds and CI/release workflows.
