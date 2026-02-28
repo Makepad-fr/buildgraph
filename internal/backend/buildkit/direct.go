@@ -118,23 +118,13 @@ func (d *DirectDriver) Build(ctx context.Context, endpoint string, req backend.B
 					if vertex == nil {
 						continue
 					}
-					state := "running"
-					if vertex.Completed != nil {
-						state = "completed"
-					}
 					if vertex.Cached {
 						cacheHits++
 					} else {
 						cacheMisses++
 					}
 					if progressFn != nil {
-						progressFn(backend.BuildProgressEvent{
-							Timestamp: time.Now().UTC(),
-							Phase:     "build",
-							Message:   vertex.Name,
-							VertexID:  vertex.Digest.String(),
-							Status:    state,
-						})
+						progressFn(toBuildProgressEvent(vertex))
 					}
 				}
 			}
@@ -169,6 +159,43 @@ func (d *DirectDriver) Build(ctx context.Context, endpoint string, req backend.B
 		Warnings:         warnings,
 		ExporterResponse: response.ExporterResponse,
 	}, nil
+}
+
+func cloneTimePtr(value *time.Time) *time.Time {
+	if value == nil {
+		return nil
+	}
+	cloned := value.UTC()
+	return &cloned
+}
+
+func toBuildProgressEvent(vertex *bkclient.Vertex) backend.BuildProgressEvent {
+	state := "running"
+	if vertex != nil && vertex.Completed != nil {
+		state = "completed"
+	}
+
+	event := backend.BuildProgressEvent{
+		Timestamp: time.Now().UTC(),
+		Phase:     "build",
+		Status:    state,
+	}
+	if vertex == nil {
+		return event
+	}
+
+	inputs := make([]string, 0, len(vertex.Inputs))
+	for _, input := range vertex.Inputs {
+		inputs = append(inputs, input.String())
+	}
+	event.Message = vertex.Name
+	event.VertexID = vertex.Digest.String()
+	event.Inputs = inputs
+	event.Started = cloneTimePtr(vertex.Started)
+	event.Completed = cloneTimePtr(vertex.Completed)
+	event.Cached = vertex.Cached
+	event.Error = vertex.Error
+	return event
 }
 
 func configureExports(solveOpt *bkclient.SolveOpt, req backend.BuildRequest) ([]string, []string, error) {

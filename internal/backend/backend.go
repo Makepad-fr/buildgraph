@@ -119,7 +119,17 @@ type DetectResult struct {
 	Mode      string            `json:"mode"`
 	Available bool              `json:"available"`
 	Details   string            `json:"details"`
+	Attempts  []DetectAttempt   `json:"attempts,omitempty"`
 	Metadata  map[string]string `json:"metadata"`
+}
+
+type DetectAttempt struct {
+	Source   string `json:"source"`
+	Endpoint string `json:"endpoint"`
+	Mode     string `json:"mode"`
+	Status   string `json:"status"`
+	Details  string `json:"details,omitempty"`
+	Error    string `json:"error,omitempty"`
 }
 
 type BackendCapabilities struct {
@@ -132,11 +142,16 @@ type BackendCapabilities struct {
 }
 
 type BuildProgressEvent struct {
-	Timestamp time.Time `json:"timestamp"`
-	Phase     string    `json:"phase"`
-	Message   string    `json:"message"`
-	VertexID  string    `json:"vertexId,omitempty"`
-	Status    string    `json:"status,omitempty"`
+	Timestamp time.Time  `json:"timestamp"`
+	Phase     string     `json:"phase"`
+	Message   string     `json:"message"`
+	VertexID  string     `json:"vertexId,omitempty"`
+	Inputs    []string   `json:"inputs,omitempty"`
+	Status    string     `json:"status,omitempty"`
+	Started   *time.Time `json:"started,omitempty"`
+	Completed *time.Time `json:"completed,omitempty"`
+	Cached    bool       `json:"cached,omitempty"`
+	Error     string     `json:"error,omitempty"`
 }
 
 type BuildProgressFunc func(BuildProgressEvent)
