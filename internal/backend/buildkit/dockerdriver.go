@@ -16,7 +16,9 @@ import (
 
 	"github.com/Makepad-fr/buildgraph/internal/backend"
 	ctrplatforms "github.com/containerd/platforms"
+	dockerconfig "github.com/docker/cli/cli/config"
 	bksession "github.com/moby/buildkit/session"
+	"github.com/moby/buildkit/session/auth/authprovider"
 	buildtypes "github.com/moby/moby/api/types/build"
 	dockerclient "github.com/moby/moby/client"
 	specs "github.com/opencontainers/image-spec/specs-go/v1"
@@ -247,6 +249,10 @@ func startDockerBuildSession(ctx context.Context, cli *dockerclient.Client) (*do
 	if err != nil {
 		return nil, fmt.Errorf("create docker build session: %w", err)
 	}
+	dockerCfg := dockerconfig.LoadDefaultConfigFile(io.Discard)
+	session.Allow(authprovider.NewDockerAuthProvider(authprovider.DockerAuthProviderConfig{
+		AuthConfigProvider: authprovider.LoadAuthConfig(dockerCfg),
+	}))
 	runCtx, cancel := context.WithCancel(ctx)
 	group, groupCtx := errgroup.WithContext(runCtx)
 	group.Go(func() error {
