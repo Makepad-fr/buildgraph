@@ -86,6 +86,16 @@ All machine-readable command output uses a versioned envelope:
 }
 ```
 
+## Rule Documentation
+
+Rule pages backing finding links are tracked in this repository:
+
+- [Rules Index](./docs/rules/index.md)
+
+Docs are published from `docs/` using the GitHub Actions workflow:
+
+- [docs.yml](./.github/workflows/docs.yml)
+
 ## What Data Is Collected
 
 `buildgraph` stores local state in a SQLite database to support diagnostics and history:
