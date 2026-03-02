@@ -1,0 +1,29 @@
+# Buildgraph Rule Reference
+
+This index maps every built-in rule ID to its documentation page.
+
+## Performance
+
+- [BG_PERF_APT_SPLIT](./BG_PERF_APT_SPLIT.md)
+- [BG_PERF_TOO_MANY_RUN](./BG_PERF_TOO_MANY_RUN.md)
+
+## Cacheability
+
+- [BG_CACHE_COPY_ALL_EARLY](./BG_CACHE_COPY_ALL_EARLY.md)
+- [BG_CACHE_ARG_LATE](./BG_CACHE_ARG_LATE.md)
+
+## Reproducibility
+
+- [BG_REPRO_FROM_MUTABLE](./BG_REPRO_FROM_MUTABLE.md)
+- [BG_REPRO_APT_UNPINNED](./BG_REPRO_APT_UNPINNED.md)
+
+## Security
+
+- [BG_SEC_ROOT_USER](./BG_SEC_ROOT_USER.md)
+- [BG_SEC_CURL_PIPE_SH](./BG_SEC_CURL_PIPE_SH.md)
+- [BG_SEC_PLAIN_SECRET_ENV](./BG_SEC_PLAIN_SECRET_ENV.md)
+
+## Policy
+
+- [BG_POL_MISSING_SOURCE_LABEL](./BG_POL_MISSING_SOURCE_LABEL.md)
+- [BG_POL_MISSING_HEALTHCHECK](./BG_POL_MISSING_HEALTHCHECK.md)
