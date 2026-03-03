@@ -1,6 +1,6 @@
-site_name: Buildgraph Docs
-site_description: Documentation for Buildgraph rules and CLI diagnostics.
-site_url: https://docs.buildgraph.dev
+site_name: Buildgraph
+site_description: Build Intelligence CLI for BuildKit-first workflows.
+site_url: https://buildgraph.dev
 docs_dir: docs
 site_dir: site
 exclude_docs: |
