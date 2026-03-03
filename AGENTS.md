@@ -27,4 +27,4 @@
 - 2026-02-26: Formalized stable JSON envelope contract with `schemaVersion` and always-present `errors` array.
 - 2026-02-26: Doctor UX now includes attempt trail, resolved backend details, paste-ready config snippet, and remediation guidance.
 - 2026-02-26: Minimum required Go version is Go 1.26 for local builds and CI/release workflows.
-- 2026-03-02: Documentation is published via MkDocs + GitHub Pages workflow (`.github/workflows/docs.yml`) with custom domain `docs.buildgraph.dev`.
+- 2026-03-03: Documentation is published via MkDocs + GitHub Pages workflow (`.github/workflows/docs.yml`) with custom domain `buildgraph.dev`.

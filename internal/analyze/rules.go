@@ -5,7 +5,7 @@ import (
 	"github.com/Makepad-fr/buildgraph/internal/policy"
 )
 
-const docsBase = "https://docs.buildgraph.dev/rules/"
+const docsBase = "https://buildgraph.dev/rules/"
 
 func BuiltinRules() map[string]policy.Rule {
 	return map[string]policy.Rule{
