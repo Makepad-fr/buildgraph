@@ -1,66 +1,87 @@
 # buildgraph
 
-`buildgraph` is a Build Intelligence CLI for BuildKit-first workflows.
+`buildgraph` is a BuildKit execution intelligence CLI: understand what your build is actually doing.
 
-## 30-Second Quickstart
+## Quick Start
 
-### Direct BuildKit socket
-
-```bash
-go build ./cmd/buildgraph
-
-./buildgraph build \
-  --context integration/fixtures \
-  --file Dockerfile.integration \
-  --output local \
-  --local-dest /tmp/buildgraph-out \
-  --endpoint unix:///run/buildkit/buildkitd.sock \
-  --progress=json \
-  --trace /tmp/buildgraph.trace.jsonl
-
-./buildgraph graph --from /tmp/buildgraph.trace.jsonl --format dot --output /tmp/buildgraph.dot
-./buildgraph top --from /tmp/buildgraph.trace.jsonl
-```
-
-### Docker Desktop / Docker Engine
+### Prerequisites
+- BuildKit endpoint reachable (`buildkitd` or Docker BuildKit).
+- Go 1.25+ to build from source.
+- Graphviz `dot` only if you want `report export --format svg`.
 
 ```bash
 go build ./cmd/buildgraph
-
-./buildgraph build \
-  --context integration/fixtures \
-  --file Dockerfile.integration \
-  --image-ref buildgraph/quickstart:dev \
-  --progress=human \
-  --trace ./buildgraph.trace.jsonl
-
-./buildgraph graph --from ./buildgraph.trace.jsonl --format json
-./buildgraph top --from ./buildgraph.trace.jsonl --limit 5
+./buildgraph analyze run --context . --file Dockerfile --output local --local-dest ./out
+./buildgraph report metrics --json
 ```
 
-## Example Output (Sample)
+## Example Output
+
+### Human output (`buildgraph report show`)
 
 ```text
-$ buildgraph top --from ./buildgraph.trace.jsonl
-Vertices analyzed: 9
-
-Slowest vertices:
-1. 4823 ms  RUN apk add --no-cache build-base (sha256:...)
-2. 2111 ms  RUN go build ./cmd/buildgraph (sha256:...)
-
-Critical path: 7034 ms
-1. FROM golang:1.26-alpine (112 ms)
-2. RUN apk add --no-cache build-base (4823 ms)
-3. RUN go build ./cmd/buildgraph (2111 ms)
+Report generated: 2026-03-04T11:48:00Z
+Command: analyze run
+Backend: buildkit
+Endpoint: unix:///run/buildkit/buildkitd.sock
+Duration: 8234ms
+Critical path: 5120ms
+Cache hit ratio: 66.67%
+Graph: complete (39 vertices, 41 edges)
+Top slow vertices:
+- [builder 6/8] RUN go test ./... (2140ms)
+- [builder 7/8] RUN go build ./cmd/buildgraph (1660ms)
+Findings: 2
 ```
 
-## Commands
+### JSON output (`--json`)
+
+```json
+{
+  "apiVersion": "buildgraph.dev/v2",
+  "kind": "BuildReport",
+  "metadata": {
+    "command": "analyze run",
+    "generatedAt": "2026-03-04T11:48:00Z"
+  },
+  "spec": {
+    "context": ".",
+    "file": "Dockerfile",
+    "backend": "auto",
+    "output": "local"
+  },
+  "status": {
+    "phase": "completed",
+    "summary": {
+      "durationMs": 8234,
+      "cacheHits": 24,
+      "cacheMisses": 12
+    },
+    "result": {
+      "command": "analyze run",
+      "graphCompleteness": "complete"
+    }
+  }
+}
+```
+
+## Command Surface
 
 ```bash
-buildgraph analyze [--context .] [--file Dockerfile] [--severity-threshold low|medium|high|critical] [--fail-on policy|security|any] [--json]
-buildgraph build [--context .] [--file Dockerfile] [--target NAME] [--platform linux/amd64] [--build-arg KEY=VALUE] [--secret id=foo,src=./foo.txt] [--output image|oci|local] [--image-ref REF] [--oci-dest PATH] [--local-dest PATH] [--backend auto|buildkit] [--endpoint URL] [--progress human|json|none] [--trace out.jsonl] [--json]
-buildgraph graph --from out.jsonl [--format dot|svg|json] [--output PATH] [--json]
-buildgraph top --from out.jsonl [--limit N] [--json]
+buildgraph analyze
+buildgraph analyze run
+buildgraph build
+
+buildgraph report show --run-id <id> | --file <report.json>
+buildgraph report metrics --run-id <id> | --file <report.json>
+buildgraph report compare --base run:<id>|<file> --head run:<id>|<file>
+buildgraph report trend --last 10
+buildgraph report export --run-id <id> --format dot|svg --out <path>
+
+buildgraph ci check --baseline-source git|ci-artifact|object-storage [...]
+buildgraph ci github-action init [--write path]
+buildgraph ci gitlab-ci init [--write path]
+
 buildgraph backend list
 buildgraph doctor
 buildgraph auth login --user <user> --token <token>
@@ -70,98 +91,29 @@ buildgraph config show
 buildgraph version
 ```
 
-## JSON Output Contract (`--json`)
+## JSON Contract
 
-All machine-readable command output uses a versioned envelope:
+All `--json` outputs use the v2 resource contract:
+- `apiVersion: buildgraph.dev/v2`
+- `kind`
+- `metadata`
+- `spec`
+- `status`
 
-```json
-{
-  "apiVersion": "buildgraph.dev/v1",
-  "command": "build",
-  "schemaVersion": "1",
-  "timestamp": "2026-02-26T00:00:00Z",
-  "durationMs": 1234,
-  "result": {},
-  "errors": []
-}
-```
-
-## Rule Documentation
-
-Rule pages backing finding links are tracked in this repository:
-
-- [Rules Index](./docs/rules/index.md)
-
-Docs are published from `docs/` using the GitHub Actions workflow:
-
-- [docs.yml](./.github/workflows/docs.yml)
-
-## What Data Is Collected
-
-`buildgraph` stores local state in a SQLite database to support diagnostics and history:
-- run metadata (`command`, duration, exit code, success/failure)
-- analysis findings
-- build result metadata
-- local events
-
-`buildgraph` can also write local build traces (`--trace`) as JSONL.
-
-## What Is Never Uploaded By Default
-
-- no build context files are uploaded by default
-- no findings/build metadata are uploaded by default
-- no telemetry is sent unless explicitly enabled (`telemetry.enabled: true`)
-
-Auth credentials are stored locally via OS keyring when available, with local file fallback.
-
-## Install from Source
-
-Requires Go 1.26+.
-
-```bash
-go build ./cmd/buildgraph
-```
-
-## Download Prebuilt Binaries
-
-Artifacts are published automatically for every GitHub release.
-
-### Linux (amd64)
-
-```bash
-curl -sSfL -o buildgraph_linux_amd64.tar.gz \
-  https://github.com/Makepad-fr/buildgraph/releases/latest/download/buildgraph_linux_amd64.tar.gz
-tar -xzf buildgraph_linux_amd64.tar.gz
-sudo install -m 0755 buildgraph /usr/local/bin/buildgraph
-```
-
-### macOS (amd64)
-
-```bash
-curl -sSfL -o buildgraph_darwin_amd64.tar.gz \
-  https://github.com/Makepad-fr/buildgraph/releases/latest/download/buildgraph_darwin_amd64.tar.gz
-tar -xzf buildgraph_darwin_amd64.tar.gz
-chmod +x buildgraph
-mv buildgraph /usr/local/bin/buildgraph
-```
-
-### Windows (amd64)
-
-```powershell
-Invoke-WebRequest -Uri "https://github.com/Makepad-fr/buildgraph/releases/latest/download/buildgraph_windows_amd64.zip" -OutFile "buildgraph_windows_amd64.zip"
-Expand-Archive -Path ".\\buildgraph_windows_amd64.zip" -DestinationPath ".\\buildgraph"
-```
+Schemas are published under [`schema/v2`](./schema/v2):
+- `resource.schema.json`
+- `buildreport.schema.json`
 
 ## Configuration
 
-Default merge precedence:
+Merge precedence:
 1. flags
 2. environment variables
 3. project config (`.buildgraph.yaml`)
 4. global config (`$XDG_CONFIG_HOME/buildgraph/config.yaml` or OS equivalent)
 5. defaults
 
-Sample config:
+Sample:
 
 ```yaml
 backend: auto
@@ -169,6 +121,15 @@ endpoint: ""
 telemetry:
   enabled: false
   sink: noop
+ci:
+  baselineSource: git
+  baselineFile: ./buildgraph-baseline.json
+  thresholds:
+    duration_total_pct: 10
+    critical_path_pct: 10
+    cache_hit_ratio_pp_drop: 10
+    cache_miss_count_pct: 15
+    warning_count_delta: 0
 defaults:
   analyze:
     dockerfile: Dockerfile
@@ -191,6 +152,6 @@ go test ./...
 ```
 
 ## Notes
-
-- Build execution avoids shelling out to Docker/BuildKit CLIs.
-- Docker-backed mode supports image export; direct BuildKit mode supports image/OCI/local exports.
+- Build execution and detection use Go APIs, not shell wrappers.
+- Telemetry remains opt-in.
+- BuildKit is the primary v0/v0.2 backend, with pluggable backend architecture for future providers.

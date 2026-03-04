@@ -1,0 +1,90 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>buildgraph.dev</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600&family=Space+Grotesk:wght@400;500;700&display=swap" rel="stylesheet" />
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <div class="bg-shape bg-shape-a"></div>
+    <div class="bg-shape bg-shape-b"></div>
+    <main>
+      <section class="hero">
+        <p class="eyebrow">BUILDGRAPH</p>
+        <h1>BuildKit execution intelligence.</h1>
+        <p class="subtitle">Understand what your container build is actually doing: critical path, cache efficiency, graph bottlenecks, and regressions.</p>
+        <div class="cta-row">
+          <a href="https://github.com/Makepad-fr/buildgraph" class="btn btn-primary">View Repository</a>
+          <a href="https://github.com/Makepad-fr/buildgraph/releases" class="btn btn-ghost">Download Releases</a>
+        </div>
+      </section>
+
+      <section>
+        <h2>Live CLI Examples</h2>
+        <div class="card-grid">
+          <article class="card">
+            <h3>Analyze + Runtime Report</h3>
+            <pre><code>buildgraph analyze run \
+  --context . \
+  --file Dockerfile \
+  --output local \
+  --local-dest ./out</code></pre>
+          </article>
+          <article class="card">
+            <h3>Regression Gate in CI</h3>
+            <pre><code>buildgraph ci check \
+  --baseline-source ci-artifact \
+  --baseline-file buildgraph-baseline.json \
+  --head-file buildgraph-report.json</code></pre>
+          </article>
+        </div>
+      </section>
+
+      <section>
+        <h2>Example Output</h2>
+        <div class="card-grid">
+          <article class="card">
+            <h3>Human</h3>
+            <pre><code>Duration: 8234ms
+Critical path: 5120ms
+Cache hit ratio: 66.67%
+Graph: complete (39 vertices, 41 edges)
+Top slow vertices:
+- [builder 6/8] RUN go test ./... (2140ms)</code></pre>
+          </article>
+          <article class="card">
+            <h3>JSON (v2)</h3>
+            <pre><code>{
+  "apiVersion": "buildgraph.dev/v2",
+  "kind": "BuildReport",
+  "metadata": { "command": "analyze run" },
+  "status": { "phase": "completed" }
+}</code></pre>
+          </article>
+        </div>
+      </section>
+
+      <section>
+        <h2>Capability Matrix</h2>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>Capability</th><th>Status</th><th>Notes</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>Critical path</td><td>Yes</td><td>Runtime DAG from BuildKit Solve status.</td></tr>
+              <tr><td>Cache efficiency</td><td>Yes</td><td>Hit/miss ratio, repeated miss patterns, stage distribution.</td></tr>
+              <tr><td>Graph export</td><td>Yes</td><td>DOT always, SVG via Graphviz <code>dot</code>.</td></tr>
+              <tr><td>CI regression gate</td><td>Yes</td><td>Configurable thresholds and baseline sources.</td></tr>
+              <tr><td>Buildah backend</td><td>Planned</td><td>Architecture remains backend-pluggable.</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+    </main>
+  </body>
+</html>

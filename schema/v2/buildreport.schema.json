@@ -1,0 +1,59 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://buildgraph.dev/schema/v2/buildreport.schema.json",
+  "title": "Buildgraph BuildReport v2",
+  "allOf": [
+    {
+      "$ref": "./resource.schema.json"
+    },
+    {
+      "type": "object",
+      "properties": {
+        "kind": {
+          "const": "BuildReport"
+        },
+        "status": {
+          "type": "object",
+          "required": ["phase", "result"],
+          "properties": {
+            "phase": {
+              "type": "string",
+              "enum": ["completed", "failed"]
+            },
+            "result": {
+              "type": "object",
+              "required": [
+                "generatedAt",
+                "command",
+                "backend",
+                "endpoint",
+                "graphCompleteness",
+                "build",
+                "findings",
+                "stageGraph",
+                "metrics",
+                "summary"
+              ],
+              "properties": {
+                "runId": { "type": "integer", "minimum": 1 },
+                "generatedAt": { "type": "string", "format": "date-time" },
+                "command": { "type": "string" },
+                "contextDir": { "type": "string" },
+                "dockerfile": { "type": "string" },
+                "backend": { "type": "string" },
+                "endpoint": { "type": "string" },
+                "graphCompleteness": { "type": "string", "enum": ["none", "partial", "complete"] },
+                "build": { "type": "object" },
+                "findings": { "type": "array", "items": { "type": "object" } },
+                "stageGraph": { "type": "object" },
+                "metrics": { "type": "object" },
+                "summary": { "type": "object" }
+              },
+              "additionalProperties": false
+            }
+          }
+        }
+      }
+    }
+  ]
+}
