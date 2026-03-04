@@ -39,6 +39,17 @@ jobs:
         with:
           go-version: '1.26.x'
 
+      - name: Install Graphviz
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y graphviz
+
+      - name: Build CLI
+        run: go build ./cmd/buildgraph
+
+      - name: Doctor JSON smoke test
+        run: ./buildgraph doctor --json
+
       - name: Start buildkitd
         run: |
           docker run -d --name buildkitd --privileged -p 1234:1234 moby/buildkit:v0.27.1 --addr tcp://0.0.0.0:1234
