@@ -10,28 +10,28 @@ import (
 func TestWriteJSONEnvelope(t *testing.T) {
 	t.Parallel()
 	buf := &bytes.Buffer{}
-	env := Envelope{
-		APIVersion:    APIVersion,
-		Command:       "analyze",
-		SchemaVersion: SchemaVersion,
-		Timestamp:     time.Unix(0, 0).UTC(),
-		DurationMS:    12,
-		Result: map[string]any{
-			"ok": true,
+	resource := Resource{
+		APIVersion: APIVersion,
+		Kind:       "AnalyzeReport",
+		Metadata: ResourceMetadata{
+			Command:     "analyze",
+			GeneratedAt: time.Unix(0, 0).UTC(),
 		},
-		Errors: []ErrorItem{},
+		Status: ResourceStatus{
+			Phase: "completed",
+			Result: map[string]any{
+				"ok": true,
+			},
+		},
 	}
-	if err := WriteJSON(buf, env); err != nil {
+	if err := WriteJSON(buf, resource); err != nil {
 		t.Fatalf("write json: %v", err)
 	}
 	text := buf.String()
-	if !strings.Contains(text, `"apiVersion": "buildgraph.dev/v1"`) {
+	if !strings.Contains(text, `"apiVersion": "buildgraph.dev/v2"`) {
 		t.Fatalf("apiVersion missing: %s", text)
 	}
-	if !strings.Contains(text, `"schemaVersion": "1"`) {
-		t.Fatalf("schemaVersion missing: %s", text)
-	}
-	if !strings.Contains(text, `"errors": []`) {
-		t.Fatalf("errors array missing: %s", text)
+	if !strings.Contains(text, `"kind": "AnalyzeReport"`) {
+		t.Fatalf("kind missing: %s", text)
 	}
 }
