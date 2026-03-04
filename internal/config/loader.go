@@ -150,6 +150,23 @@ func merge(base, overlay Config) Config {
 	if overlay.Auth.User != "" {
 		result.Auth.User = overlay.Auth.User
 	}
+	if overlay.CI.BaselineSource != "" {
+		result.CI.BaselineSource = overlay.CI.BaselineSource
+	}
+	if overlay.CI.BaselineFile != "" {
+		result.CI.BaselineFile = overlay.CI.BaselineFile
+	}
+	if overlay.CI.BaselineURL != "" {
+		result.CI.BaselineURL = overlay.CI.BaselineURL
+	}
+	if len(overlay.CI.Thresholds) > 0 {
+		if result.CI.Thresholds == nil {
+			result.CI.Thresholds = map[string]float64{}
+		}
+		for key, value := range overlay.CI.Thresholds {
+			result.CI.Thresholds[key] = value
+		}
+	}
 	if overlay.Defaults.Analyze.Dockerfile != "" {
 		result.Defaults.Analyze.Dockerfile = overlay.Defaults.Analyze.Dockerfile
 	}
@@ -194,6 +211,15 @@ func applyEnv(cfg Config) Config {
 	}
 	if v := strings.TrimSpace(os.Getenv("BUILDGRAPH_AUTH_ENDPOINT")); v != "" {
 		cfg.Auth.Endpoint = v
+	}
+	if v := strings.TrimSpace(os.Getenv("BUILDGRAPH_BASELINE_SOURCE")); v != "" {
+		cfg.CI.BaselineSource = v
+	}
+	if v := strings.TrimSpace(os.Getenv("BUILDGRAPH_BASELINE_FILE")); v != "" {
+		cfg.CI.BaselineFile = v
+	}
+	if v := strings.TrimSpace(os.Getenv("BUILDGRAPH_BASELINE_URL")); v != "" {
+		cfg.CI.BaselineURL = v
 	}
 	return cfg
 }

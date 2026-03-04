@@ -2,16 +2,19 @@ package cli
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
+	"os"
 	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/Makepad-fr/buildgraph/internal/analyze"
 	"github.com/Makepad-fr/buildgraph/internal/backend"
 	"github.com/Makepad-fr/buildgraph/internal/backend/buildkit"
 	"github.com/Makepad-fr/buildgraph/internal/config"
@@ -19,8 +22,8 @@ import (
 	"github.com/Makepad-fr/buildgraph/internal/platform/auth"
 	"github.com/Makepad-fr/buildgraph/internal/platform/capabilities"
 	"github.com/Makepad-fr/buildgraph/internal/platform/events"
+	"github.com/Makepad-fr/buildgraph/internal/report"
 	"github.com/Makepad-fr/buildgraph/internal/state"
-	"github.com/Makepad-fr/buildgraph/internal/trace"
 	"github.com/Makepad-fr/buildgraph/internal/version"
 )
 
@@ -81,7 +84,7 @@ func (a *App) Run(ctx context.Context, args []string) int {
 		Profile:     global.Profile,
 	})
 	if err != nil {
-		a.writeError(global.JSON, remaining[0], 0, err)
+		a.writeError(global.JSON, "config", err)
 		return ExitConfigState
 	}
 
@@ -95,8 +98,11 @@ func (a *App) Run(ctx context.Context, args []string) int {
 	start := time.Now().UTC()
 	exitCode := ExitOK
 	runErr := error(nil)
+
 	var recordFindings []backend.Finding
 	var recordBuild *backend.BuildResult
+	var recordReport *report.BuildReport
+	commandLabel := command
 
 	var emit events.Sink = events.NoopSink{}
 	if stateStore != nil {
@@ -107,15 +113,23 @@ func (a *App) Run(ctx context.Context, args []string) int {
 	case "help", "--help", "-h":
 		a.printHelp(a.io.Out)
 	case "analyze":
-		result, findings, code, err := a.runAnalyze(ctx, global, loadedCfg, cmdArgs)
+		cmd, findings, buildResult, runReport, code, err := a.runAnalyze(ctx, global, loadedCfg, stateStore, cmdArgs)
+		commandLabel = cmd
 		exitCode = code
 		runErr = err
 		recordFindings = findings
+		recordBuild = buildResult
+		recordReport = runReport
 		if err == nil {
-			_ = emit.Emit(ctx, events.Event{Name: "analyze.completed", Payload: result, CreatedAt: time.Now().UTC()})
+			payload := any(runReport)
+			if payload == nil {
+				payload = map[string]any{"findingCount": len(findings)}
+			}
+			_ = emit.Emit(ctx, events.Event{Name: cmd + ".completed", Payload: payload, CreatedAt: time.Now().UTC()})
 		}
 	case "build":
 		result, code, err := a.runBuild(ctx, global, loadedCfg, cmdArgs)
+		commandLabel = "build"
 		exitCode = code
 		runErr = err
 		recordBuild = result
@@ -123,18 +137,25 @@ func (a *App) Run(ctx context.Context, args []string) int {
 			_ = emit.Emit(ctx, events.Event{Name: "build.completed", Payload: result, CreatedAt: time.Now().UTC()})
 		}
 	case "backend":
+		commandLabel = "backend"
 		exitCode, runErr = a.runBackend(global, cmdArgs)
-	case "graph":
-		exitCode, runErr = a.runGraph(global, cmdArgs)
-	case "top":
-		exitCode, runErr = a.runTop(global, cmdArgs)
 	case "doctor":
+		commandLabel = "doctor"
 		exitCode, runErr = a.runDoctor(ctx, global, loadedCfg, stateStore)
+	case "report":
+		commandLabel = "report"
+		exitCode, runErr = a.runReport(ctx, global, loadedCfg, stateStore, cmdArgs)
+	case "ci":
+		commandLabel = "ci"
+		exitCode, runErr = a.runCI(ctx, global, loadedCfg, stateStore, cmdArgs)
 	case "auth":
+		commandLabel = "auth"
 		exitCode, runErr = a.runAuth(global, cmdArgs)
 	case "config":
+		commandLabel = "config"
 		exitCode, runErr = a.runConfig(global, loadedCfg, cmdArgs)
 	case "version":
+		commandLabel = "version"
 		exitCode, runErr = a.runVersion(global)
 	default:
 		runErr = fmt.Errorf("unknown command %q", command)
@@ -158,27 +179,35 @@ func (a *App) Run(ctx context.Context, args []string) int {
 			if recordBuild != nil {
 				_ = stateStore.RecordBuild(ctx, runID, *recordBuild)
 			}
+			if recordReport != nil {
+				reportCopy := *recordReport
+				reportCopy.RunID = runID
+				_ = stateStore.RecordReport(ctx, runID, "BuildReport", reportCopy)
+			}
 		}
 	}
 
 	if runErr != nil {
 		if !isReportedError(runErr) {
-			a.writeError(global.JSON, command, time.Since(start).Milliseconds(), runErr)
+			a.writeError(global.JSON, commandLabel, runErr)
 		}
 	}
 
 	return exitCode
 }
 
-func (a *App) runAnalyze(ctx context.Context, global GlobalOptions, loaded config.Loaded, args []string) (backend.AnalyzeResult, []backend.Finding, int, error) {
-	startedAt := time.Now().UTC()
+func (a *App) runAnalyze(ctx context.Context, global GlobalOptions, loaded config.Loaded, store *state.Store, args []string) (string, []backend.Finding, *backend.BuildResult, *report.BuildReport, int, error) {
+	if len(args) > 0 && args[0] == "run" {
+		rep, findings, buildResult, code, err := a.runAnalyzeRun(ctx, global, loaded, args[1:])
+		return "analyze run", findings, buildResult, rep, code, err
+	}
 
 	allowed, err := a.capabilities.Has(ctx, capabilities.FeatureAnalyze)
 	if err != nil {
-		return backend.AnalyzeResult{}, nil, ExitAuthDenied, err
+		return "analyze", nil, nil, nil, ExitAuthDenied, err
 	}
 	if !allowed {
-		return backend.AnalyzeResult{}, nil, ExitAuthDenied, fmt.Errorf("capability denied: analyze")
+		return "analyze", nil, nil, nil, ExitAuthDenied, fmt.Errorf("capability denied: analyze")
 	}
 
 	fs := flag.NewFlagSet("analyze", flag.ContinueOnError)
@@ -192,12 +221,12 @@ func (a *App) runAnalyze(ctx context.Context, global GlobalOptions, loaded confi
 	endpoint := fs.String("endpoint", loaded.Config.Endpoint, "BuildKit endpoint")
 
 	if err := fs.Parse(args); err != nil {
-		return backend.AnalyzeResult{}, nil, ExitUsage, err
+		return "analyze", nil, nil, nil, ExitUsage, err
 	}
 
 	selectedBackend, err := a.resolveBackend(*backendName)
 	if err != nil {
-		return backend.AnalyzeResult{}, nil, ExitBackend, err
+		return "analyze", nil, nil, nil, ExitBackend, err
 	}
 
 	result, err := selectedBackend.Analyze(ctx, backend.AnalyzeRequest{
@@ -212,39 +241,210 @@ func (a *App) runAnalyze(ctx context.Context, global GlobalOptions, loaded confi
 		EnablePolicyChecks: true,
 	})
 	if err != nil {
-		return backend.AnalyzeResult{}, nil, ExitBackend, err
+		return "analyze", nil, nil, nil, ExitBackend, err
 	}
 
 	failure := shouldFailFindings(result.Findings, strings.ToLower(strings.TrimSpace(*failOn)))
 	failErr := fmt.Errorf("analysis found violations matching fail-on=%s", *failOn)
 
+	summary := map[string]any{
+		"findingCount": len(result.Findings),
+		"backend":      result.Backend,
+		"endpoint":     result.Endpoint,
+	}
+	spec := map[string]any{
+		"context":           *contextDir,
+		"file":              *dockerfile,
+		"severityThreshold": *severityThreshold,
+		"failOn":            *failOn,
+		"backend":           *backendName,
+		"endpoint":          *endpoint,
+	}
 	if global.JSON {
-		errors := []output.ErrorItem{}
 		if failure {
-			errors = append(errors, output.ErrorItem{Code: "violation", Message: failErr.Error()})
-		}
-		if err := output.WriteJSON(a.io.Out, output.NewEnvelope("analyze", startedAt, result, errors)); err != nil {
-			return backend.AnalyzeResult{}, nil, ExitInternal, err
+			resource := output.Resource{
+				APIVersion: output.APIVersion,
+				Kind:       "AnalyzeReport",
+				Metadata:   output.ResourceMetadata{Command: "analyze", GeneratedAt: time.Now().UTC()},
+				Spec:       spec,
+				Status: output.ResourceStatus{
+					Phase:   "failed",
+					Summary: summary,
+					Result:  result,
+					Errors:  []output.ErrorItem{{Code: "violation", Message: failErr.Error()}},
+				},
+			}
+			_ = output.WriteJSON(a.io.Out, resource)
+		} else {
+			_ = output.WriteJSON(a.io.Out, output.SuccessResource("AnalyzeReport", "analyze", spec, summary, result, 0))
 		}
 	} else {
-		if err := output.WriteAnalyze(a.io.Out, result); err != nil {
-			return backend.AnalyzeResult{}, nil, ExitInternal, err
-		}
+		_ = output.WriteAnalyze(a.io.Out, result)
 	}
 
 	if failure {
 		if global.JSON {
-			return result, result.Findings, ExitPolicyViolation, markReportedError(failErr)
+			return "analyze", result.Findings, nil, nil, ExitPolicyViolation, markReportedError(failErr)
 		}
-		return result, result.Findings, ExitPolicyViolation, failErr
+		return "analyze", result.Findings, nil, nil, ExitPolicyViolation, failErr
+	}
+	return "analyze", result.Findings, nil, nil, ExitOK, nil
+}
+
+func (a *App) runAnalyzeRun(ctx context.Context, global GlobalOptions, loaded config.Loaded, args []string) (*report.BuildReport, []backend.Finding, *backend.BuildResult, int, error) {
+	allowedAnalyze, err := a.capabilities.Has(ctx, capabilities.FeatureAnalyze)
+	if err != nil {
+		return nil, nil, nil, ExitAuthDenied, err
+	}
+	if !allowedAnalyze {
+		return nil, nil, nil, ExitAuthDenied, fmt.Errorf("capability denied: analyze")
+	}
+	allowedBuild, err := a.capabilities.Has(ctx, capabilities.FeatureBuild)
+	if err != nil {
+		return nil, nil, nil, ExitAuthDenied, err
+	}
+	if !allowedBuild {
+		return nil, nil, nil, ExitAuthDenied, fmt.Errorf("capability denied: build")
 	}
 
-	return result, result.Findings, ExitOK, nil
+	fs := flag.NewFlagSet("analyze run", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+
+	contextDir := fs.String("context", ".", "Build context path")
+	dockerfile := fs.String("file", loaded.Config.Defaults.Analyze.Dockerfile, "Dockerfile path")
+	severityThreshold := fs.String("severity-threshold", loaded.Config.Defaults.Analyze.SeverityThreshold, "Minimum severity: low|medium|high|critical")
+	failOn := fs.String("fail-on", loaded.Config.Defaults.Analyze.FailOn, "Failure mode: policy|security|any")
+	target := fs.String("target", "", "Build stage target")
+	platforms := stringSliceFlag{}
+	buildArgs := kvSliceFlag{}
+	secrets := kvSliceFlag{}
+	outputMode := fs.String("output", loaded.Config.Defaults.Build.OutputMode, "Output mode: image|oci|local")
+	imageRef := fs.String("image-ref", loaded.Config.Defaults.Build.ImageRef, "Image reference for image output")
+	ociDest := fs.String("oci-dest", "", "Destination path for OCI tar")
+	localDest := fs.String("local-dest", "", "Destination directory for local output")
+	backendName := fs.String("backend", loaded.Config.Backend, "Backend selector")
+	endpoint := fs.String("endpoint", loaded.Config.Endpoint, "BuildKit endpoint")
+
+	fs.Var(&platforms, "platform", "Target platform (repeatable)")
+	fs.Var(&buildArgs, "build-arg", "Build arg key=value (repeatable)")
+	fs.Var(&secrets, "secret", "Build secret id=...,src=... (repeatable)")
+
+	if err := fs.Parse(args); err != nil {
+		return nil, nil, nil, ExitUsage, err
+	}
+
+	selectedBackend, err := a.resolveBackend(*backendName)
+	if err != nil {
+		return nil, nil, nil, ExitBackend, err
+	}
+
+	progress := func(event backend.BuildProgressEvent) {
+		if global.JSON {
+			return
+		}
+		fmt.Fprintf(a.io.Err, "[%s] %s\n", event.Phase, strings.TrimSpace(event.Message))
+	}
+
+	buildResult, err := selectedBackend.Build(ctx, backend.BuildRequest{
+		ContextDir:        *contextDir,
+		Dockerfile:        *dockerfile,
+		Target:            *target,
+		Platforms:         platforms,
+		BuildArgs:         buildArgs.toBuildArgs(),
+		Secrets:           parseSecrets(secrets),
+		OutputMode:        strings.ToLower(strings.TrimSpace(*outputMode)),
+		ImageRef:          *imageRef,
+		OCIDest:           *ociDest,
+		LocalDest:         *localDest,
+		Backend:           *backendName,
+		Endpoint:          *endpoint,
+		ProjectConfigPath: loaded.Paths.ProjectPath,
+		GlobalConfigPath:  loaded.Paths.GlobalPath,
+	}, progress)
+	if err != nil {
+		return nil, nil, nil, ExitBuildFailed, err
+	}
+
+	analyzeResult, err := selectedBackend.Analyze(ctx, backend.AnalyzeRequest{
+		ContextDir:         *contextDir,
+		Dockerfile:         *dockerfile,
+		SeverityThreshold:  normalizeSeverity(*severityThreshold),
+		FailOn:             strings.ToLower(strings.TrimSpace(*failOn)),
+		Backend:            *backendName,
+		Endpoint:           *endpoint,
+		ProjectConfigPath:  loaded.Paths.ProjectPath,
+		GlobalConfigPath:   loaded.Paths.GlobalPath,
+		EnablePolicyChecks: true,
+	})
+	if err != nil {
+		return nil, nil, nil, ExitBackend, err
+	}
+
+	stageGraph, stageErr := analyze.ParseStageGraph(*contextDir, *dockerfile)
+	if stageErr != nil {
+		stageGraph = analyze.StageGraph{}
+		buildResult.Warnings = append(buildResult.Warnings, "unable to parse stage graph: "+stageErr.Error())
+	}
+
+	runReport := report.NewBuildReport(report.BuildReportInput{
+		RunID:       0,
+		Command:     "analyze run",
+		ContextDir:  *contextDir,
+		Dockerfile:  *dockerfile,
+		Build:       buildResult,
+		Findings:    analyzeResult.Findings,
+		StageGraph:  stageGraph,
+		GeneratedAt: time.Now().UTC(),
+	})
+
+	spec := map[string]any{
+		"context":           *contextDir,
+		"file":              *dockerfile,
+		"backend":           *backendName,
+		"endpoint":          *endpoint,
+		"severityThreshold": *severityThreshold,
+		"failOn":            *failOn,
+		"target":            *target,
+		"platform":          []string(platforms),
+		"output":            *outputMode,
+	}
+
+	failure := shouldFailFindings(analyzeResult.Findings, strings.ToLower(strings.TrimSpace(*failOn)))
+	failErr := fmt.Errorf("analysis found violations matching fail-on=%s", *failOn)
+
+	if global.JSON {
+		if failure {
+			resource := output.Resource{
+				APIVersion: output.APIVersion,
+				Kind:       "BuildReport",
+				Metadata:   output.ResourceMetadata{Command: "analyze run", GeneratedAt: time.Now().UTC()},
+				Spec:       spec,
+				Status: output.ResourceStatus{
+					Phase:   "failed",
+					Summary: runReport.Summary,
+					Result:  runReport,
+					Errors:  []output.ErrorItem{{Code: "violation", Message: failErr.Error()}},
+				},
+			}
+			_ = output.WriteJSON(a.io.Out, resource)
+		} else {
+			_ = output.WriteJSON(a.io.Out, output.SuccessResource("BuildReport", "analyze run", spec, runReport.Summary, runReport, 0))
+		}
+	} else {
+		_ = output.WriteBuildReport(a.io.Out, runReport)
+	}
+
+	if failure {
+		if global.JSON {
+			return &runReport, analyzeResult.Findings, &buildResult, ExitPolicyViolation, markReportedError(failErr)
+		}
+		return &runReport, analyzeResult.Findings, &buildResult, ExitPolicyViolation, failErr
+	}
+
+	return &runReport, analyzeResult.Findings, &buildResult, ExitOK, nil
 }
 
 func (a *App) runBuild(ctx context.Context, global GlobalOptions, loaded config.Loaded, args []string) (*backend.BuildResult, int, error) {
-	startedAt := time.Now().UTC()
-
 	allowed, err := a.capabilities.Has(ctx, capabilities.FeatureBuild)
 	if err != nil {
 		return nil, ExitAuthDenied, err
@@ -268,8 +468,6 @@ func (a *App) runBuild(ctx context.Context, global GlobalOptions, loaded config.
 	localDest := fs.String("local-dest", "", "Destination directory for local output")
 	backendName := fs.String("backend", loaded.Config.Backend, "Backend selector")
 	endpoint := fs.String("endpoint", loaded.Config.Endpoint, "BuildKit endpoint")
-	progressModeRaw := fs.String("progress", "auto", "Progress mode: human|json|none")
-	tracePath := fs.String("trace", "", "Write build trace to JSONL path")
 
 	fs.Var(&platforms, "platform", "Target platform (repeatable)")
 	fs.Var(&buildArgs, "build-arg", "Build arg key=value (repeatable)")
@@ -284,41 +482,11 @@ func (a *App) runBuild(ctx context.Context, global GlobalOptions, loaded config.
 		return nil, ExitBackend, err
 	}
 
-	progressMode, err := normalizeProgressMode(*progressModeRaw, global.JSON)
-	if err != nil {
-		return nil, ExitUsage, err
-	}
-
-	var traceFile io.Closer
-	var traceWriter *trace.Writer
-	if path := strings.TrimSpace(*tracePath); path != "" {
-		file, writer, err := trace.OpenFileWriter(path)
-		if err != nil {
-			return nil, ExitConfigState, err
-		}
-		traceFile = file
-		traceWriter = writer
-		defer traceFile.Close()
-	}
-
-	var stderrTraceWriter *trace.Writer
-	if progressMode == "json" {
-		stderrTraceWriter = trace.NewWriter(a.io.Err)
-	}
-
 	progress := func(event backend.BuildProgressEvent) {
-		record := trace.ProgressRecord("build", event)
-		if traceWriter != nil {
-			_ = traceWriter.WriteRecord(record)
+		if global.JSON {
+			return
 		}
-		switch progressMode {
-		case "human":
-			fmt.Fprintf(a.io.Err, "[%s] %s\n", event.Phase, strings.TrimSpace(event.Message))
-		case "json":
-			if stderrTraceWriter != nil {
-				_ = stderrTraceWriter.WriteRecord(record)
-			}
-		}
+		fmt.Fprintf(a.io.Err, "[%s] %s\n", event.Phase, strings.TrimSpace(event.Message))
 	}
 
 	result, err := selectedBackend.Build(ctx, backend.BuildRequest{
@@ -338,30 +506,30 @@ func (a *App) runBuild(ctx context.Context, global GlobalOptions, loaded config.
 		GlobalConfigPath:  loaded.Paths.GlobalPath,
 	}, progress)
 	if err != nil {
-		if traceWriter != nil {
-			_ = traceWriter.WriteRecord(trace.FailureRecord("build", "build_failed", err.Error()))
-		}
 		return nil, ExitBuildFailed, err
-	}
-	if traceWriter != nil {
-		_ = traceWriter.WriteRecord(trace.ResultRecord("build", result))
 	}
 
 	if global.JSON {
-		if err := output.WriteJSON(a.io.Out, output.NewEnvelope("build", startedAt, result, nil)); err != nil {
-			return nil, ExitInternal, err
+		summary := map[string]any{
+			"outputs":     len(result.Outputs),
+			"cacheHits":   result.CacheStats.Hits,
+			"cacheMisses": result.CacheStats.Misses,
 		}
+		spec := map[string]any{
+			"context":  *contextDir,
+			"file":     *dockerfile,
+			"backend":  *backendName,
+			"endpoint": *endpoint,
+			"output":   *outputMode,
+		}
+		_ = output.WriteJSON(a.io.Out, output.SuccessResource("BuildExecutionReport", "build", spec, summary, result, 0))
 	} else {
-		if err := output.WriteBuild(a.io.Out, result); err != nil {
-			return nil, ExitInternal, err
-		}
+		_ = output.WriteBuild(a.io.Out, result)
 	}
 	return &result, ExitOK, nil
 }
 
 func (a *App) runBackend(global GlobalOptions, args []string) (int, error) {
-	startedAt := time.Now().UTC()
-
 	if len(args) == 0 {
 		return ExitUsage, fmt.Errorf("backend subcommand is required")
 	}
@@ -370,9 +538,9 @@ func (a *App) runBackend(global GlobalOptions, args []string) (int, error) {
 	}
 	names := a.registry.List()
 	if global.JSON {
-		return ExitOK, output.WriteJSON(a.io.Out, output.NewEnvelope("backend list", startedAt, map[string]any{
-			"backends": names,
-		}, nil))
+		summary := map[string]any{"count": len(names)}
+		result := map[string]any{"backends": names}
+		return ExitOK, output.WriteJSON(a.io.Out, output.SuccessResource("BackendList", "backend list", nil, summary, result, 0))
 	}
 	for _, name := range names {
 		fmt.Fprintln(a.io.Out, name)
@@ -381,82 +549,524 @@ func (a *App) runBackend(global GlobalOptions, args []string) (int, error) {
 }
 
 func (a *App) runDoctor(ctx context.Context, global GlobalOptions, loaded config.Loaded, store *state.Store) (int, error) {
-	startedAt := time.Now().UTC()
-
 	checks := map[string]string{
 		"config.global":  status(loaded.Paths.GlobalExists, loaded.Paths.GlobalPath),
 		"config.project": status(loaded.Paths.ProjectExists, loaded.Paths.ProjectPath),
 	}
-	hasError := false
+	doctorReport := output.DoctorReport{
+		Checks: checks,
+		CommonFixes: []string{
+			"Set --endpoint or BUILDKIT_HOST to a reachable BuildKit daemon.",
+			"Run buildkitd locally or start Docker Desktop with BuildKit enabled.",
+			"Set ci.baselineSource with matching baselineFile/baselineUrl in config for CI checks.",
+		},
+	}
 	if store != nil {
 		checks["state.sqlite"] = "ok: " + store.Path()
 	} else {
 		checks["state.sqlite"] = "error: unavailable"
-		hasError = true
-	}
-
-	detect := backend.DetectResult{
-		Backend:  buildkit.BackendName,
-		Mode:     "none",
-		Details:  "backend detection was not executed",
-		Metadata: map[string]string{},
 	}
 
 	selectedBackend, err := a.resolveBackend(loaded.Config.Backend)
 	if err != nil {
 		checks["backend.detect"] = "error: " + err.Error()
-		detect.Details = err.Error()
-		hasError = true
 	} else {
-		detect, err = selectedBackend.Detect(ctx, backend.DetectRequest{
+		detect, detectErr := selectedBackend.Detect(ctx, backend.DetectRequest{
 			Backend:           loaded.Config.Backend,
 			Endpoint:          loaded.Config.Endpoint,
 			ProjectConfigPath: loaded.Paths.ProjectPath,
 			GlobalConfigPath:  loaded.Paths.GlobalPath,
 		})
-		if err != nil {
-			checks["backend.detect"] = "error: " + err.Error()
-			hasError = true
+		if detectErr != nil {
+			checks["backend.detect"] = "error: " + detectErr.Error()
 		} else {
 			checks["backend.detect"] = fmt.Sprintf("ok: mode=%s endpoint=%s", detect.Mode, detect.Endpoint)
+			doctorReport.Found = detect
+			doctorReport.Attempts = detect.Attempts
+			doctorReport.ConfigSnippet = fmt.Sprintf("backend: buildkit\nendpoint: %q\n", detect.Endpoint)
 		}
 	}
 
-	report := output.DoctorReport{
-		Checks:        checks,
-		Attempts:      detect.Attempts,
-		Found:         detect,
-		ConfigSnippet: doctorConfigSnippet(loaded.Config.Endpoint, detect.Endpoint),
-		CommonFixes:   doctorCommonFixes(loaded.Config.Endpoint, detect),
+	if version, err := report.GraphvizVersion(); err != nil {
+		checks["graphviz.dot"] = "error: dot not found"
+	} else {
+		checks["graphviz.dot"] = "ok: " + version
 	}
 
+	source := strings.TrimSpace(loaded.Config.CI.BaselineSource)
+	if source == "" {
+		checks["ci.baseline"] = "missing: baselineSource not configured"
+	} else {
+		switch source {
+		case "git", "ci-artifact":
+			if strings.TrimSpace(loaded.Config.CI.BaselineFile) == "" {
+				checks["ci.baseline"] = "error: baselineFile required for source=" + source
+			} else {
+				checks["ci.baseline"] = "ok: source=" + source
+			}
+		case "object-storage":
+			if strings.TrimSpace(loaded.Config.CI.BaselineURL) == "" {
+				checks["ci.baseline"] = "error: baselineUrl required for source=object-storage"
+			} else {
+				checks["ci.baseline"] = "ok: source=object-storage"
+			}
+		default:
+			checks["ci.baseline"] = "error: unsupported source=" + source
+		}
+	}
+
+	summary := map[string]any{"checkCount": len(checks)}
 	if global.JSON {
-		errors := []output.ErrorItem{}
-		if hasError {
-			errors = append(errors, output.ErrorItem{Code: "doctor_failed", Message: "doctor detected failing checks"})
-		}
-		if err := output.WriteJSON(a.io.Out, output.NewEnvelope("doctor", startedAt, report, errors)); err != nil {
+		if err := output.WriteJSON(a.io.Out, output.SuccessResource("DoctorReport", "doctor", nil, summary, doctorReport, 0)); err != nil {
 			return ExitInternal, err
 		}
 	} else {
-		if err := output.WriteDoctor(a.io.Out, report); err != nil {
+		if err := output.WriteDoctor(a.io.Out, doctorReport); err != nil {
 			return ExitInternal, err
 		}
 	}
 
-	if hasError {
-		err := fmt.Errorf("doctor detected failing checks")
-		if global.JSON {
-			return ExitBackend, markReportedError(err)
+	for _, value := range checks {
+		if strings.HasPrefix(value, "error:") {
+			err := fmt.Errorf("doctor detected failing checks")
+			if global.JSON {
+				return ExitBackend, markReportedError(err)
+			}
+			return ExitBackend, err
 		}
-		return ExitBackend, err
+	}
+	return ExitOK, nil
+}
+
+func (a *App) runReport(ctx context.Context, global GlobalOptions, loaded config.Loaded, store *state.Store, args []string) (int, error) {
+	if len(args) == 0 {
+		return ExitUsage, fmt.Errorf("report subcommand is required")
+	}
+	switch args[0] {
+	case "show":
+		return a.runReportShow(ctx, global, store, args[1:])
+	case "metrics":
+		return a.runReportMetrics(ctx, global, store, args[1:])
+	case "compare":
+		return a.runReportCompare(ctx, global, loaded, store, args[1:])
+	case "trend":
+		return a.runReportTrend(ctx, global, store, args[1:])
+	case "export":
+		return a.runReportExport(ctx, global, store, args[1:])
+	default:
+		return ExitUsage, fmt.Errorf("unsupported report subcommand %q", args[0])
+	}
+}
+
+func (a *App) runReportShow(ctx context.Context, global GlobalOptions, store *state.Store, args []string) (int, error) {
+	fs := flag.NewFlagSet("report show", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	runID := fs.Int64("run-id", 0, "Run ID")
+	file := fs.String("file", "", "Path to BuildReport JSON")
+	if err := fs.Parse(args); err != nil {
+		return ExitUsage, err
+	}
+
+	runReport, source, err := a.resolveReportSource(ctx, store, *runID, *file)
+	if err != nil {
+		return ExitConfigState, err
+	}
+	if global.JSON {
+		spec := map[string]any{"source": source}
+		if err := output.WriteJSON(a.io.Out, output.SuccessResource("BuildReport", "report show", spec, runReport.Summary, runReport, runReport.RunID)); err != nil {
+			return ExitInternal, err
+		}
+	} else {
+		if err := output.WriteBuildReport(a.io.Out, runReport); err != nil {
+			return ExitInternal, err
+		}
+	}
+	return ExitOK, nil
+}
+
+func (a *App) runReportMetrics(ctx context.Context, global GlobalOptions, store *state.Store, args []string) (int, error) {
+	fs := flag.NewFlagSet("report metrics", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	runID := fs.Int64("run-id", 0, "Run ID")
+	file := fs.String("file", "", "Path to BuildReport JSON")
+	if err := fs.Parse(args); err != nil {
+		return ExitUsage, err
+	}
+
+	runReport, source, err := a.resolveReportSource(ctx, store, *runID, *file)
+	if err != nil {
+		return ExitConfigState, err
+	}
+	if global.JSON {
+		spec := map[string]any{"source": source}
+		if err := output.WriteJSON(a.io.Out, output.SuccessResource("MetricsReport", "report metrics", spec, runReport.Summary, runReport.Metrics, runReport.RunID)); err != nil {
+			return ExitInternal, err
+		}
+	} else {
+		if _, err := fmt.Fprintf(a.io.Out, "Critical path: %dms\nCache hit ratio: %.2f%%\n", runReport.Metrics.CriticalPathMS, runReport.Metrics.CacheHitRatio*100); err != nil {
+			return ExitInternal, err
+		}
+		if len(runReport.Metrics.TopSlowVertices) > 0 {
+			if _, err := fmt.Fprintln(a.io.Out, "Top slow vertices:"); err != nil {
+				return ExitInternal, err
+			}
+			for _, vertex := range runReport.Metrics.TopSlowVertices {
+				if _, err := fmt.Fprintf(a.io.Out, "- %s (%dms)\n", strings.TrimSpace(vertex.Name), vertex.DurationMS); err != nil {
+					return ExitInternal, err
+				}
+			}
+		}
+	}
+	return ExitOK, nil
+}
+
+func (a *App) runReportCompare(ctx context.Context, global GlobalOptions, loaded config.Loaded, store *state.Store, args []string) (int, error) {
+	fs := flag.NewFlagSet("report compare", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	baseSource := fs.String("base", "", "Base report source (run:<id> or file path)")
+	headSource := fs.String("head", "", "Head report source (run:<id> or file path)")
+	thresholds := thresholdFlag{}
+	fs.Var(&thresholds, "threshold", "Threshold override key=value (repeatable)")
+	if err := fs.Parse(args); err != nil {
+		return ExitUsage, err
+	}
+	if strings.TrimSpace(*baseSource) == "" || strings.TrimSpace(*headSource) == "" {
+		return ExitUsage, fmt.Errorf("--base and --head are required")
+	}
+
+	baseReport, baseRef, err := a.resolveReportNamedSource(ctx, store, *baseSource)
+	if err != nil {
+		return ExitConfigState, err
+	}
+	headReport, headRef, err := a.resolveReportNamedSource(ctx, store, *headSource)
+	if err != nil {
+		return ExitConfigState, err
+	}
+
+	effectiveThresholds := mergeThresholdMaps(loaded.Config.CI.Thresholds, thresholds)
+	cmp := report.Compare(baseReport, headReport, effectiveThresholds, baseRef, headRef)
+
+	if global.JSON {
+		spec := map[string]any{"base": baseRef, "head": headRef, "thresholds": effectiveThresholds}
+		phase := "completed"
+		if !cmp.Passed {
+			phase = "failed"
+		}
+		resource := output.Resource{
+			APIVersion: output.APIVersion,
+			Kind:       "CompareReport",
+			Metadata:   output.ResourceMetadata{Command: "report compare", GeneratedAt: time.Now().UTC()},
+			Spec:       spec,
+			Status: output.ResourceStatus{
+				Phase:   phase,
+				Summary: map[string]any{"passed": cmp.Passed, "regressionCount": len(cmp.Regressions)},
+				Result:  cmp,
+			},
+		}
+		if !cmp.Passed {
+			resource.Status.Errors = []output.ErrorItem{{Code: "regression", Message: strings.Join(cmp.Regressions, "; ")}}
+		}
+		if err := output.WriteJSON(a.io.Out, resource); err != nil {
+			return ExitInternal, err
+		}
+	} else {
+		if err := output.WriteCompareReport(a.io.Out, cmp); err != nil {
+			return ExitInternal, err
+		}
+	}
+
+	if !cmp.Passed {
+		err := fmt.Errorf("regressions detected")
+		if global.JSON {
+			return ExitPolicyViolation, markReportedError(err)
+		}
+		return ExitPolicyViolation, err
+	}
+	return ExitOK, nil
+}
+
+func (a *App) runReportTrend(ctx context.Context, global GlobalOptions, store *state.Store, args []string) (int, error) {
+	if store == nil {
+		return ExitConfigState, fmt.Errorf("state store unavailable")
+	}
+	fs := flag.NewFlagSet("report trend", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	last := fs.Int("last", 10, "Number of recent runs")
+	_ = fs.String("branch", "", "Branch hint (reserved)")
+	if err := fs.Parse(args); err != nil {
+		return ExitUsage, err
+	}
+
+	recs, err := store.ListRecentReports(ctx, *last)
+	if err != nil {
+		return ExitConfigState, err
+	}
+	reports := make([]report.BuildReport, 0, len(recs))
+	for i := len(recs) - 1; i >= 0; i-- {
+		runReport, err := report.ParseBuildReportJSON([]byte(recs[i].ReportJSON))
+		if err != nil {
+			continue
+		}
+		runReport.RunID = recs[i].RunID
+		reports = append(reports, runReport)
+	}
+	trend := report.BuildTrend(reports)
+
+	if global.JSON {
+		spec := map[string]any{"last": *last}
+		if err := output.WriteJSON(a.io.Out, output.SuccessResource("TrendReport", "report trend", spec, map[string]any{"window": trend.Window}, trend, 0)); err != nil {
+			return ExitInternal, err
+		}
+	} else {
+		if err := output.WriteTrendReport(a.io.Out, trend); err != nil {
+			return ExitInternal, err
+		}
+	}
+	return ExitOK, nil
+}
+
+func (a *App) runReportExport(ctx context.Context, global GlobalOptions, store *state.Store, args []string) (int, error) {
+	fs := flag.NewFlagSet("report export", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	runID := fs.Int64("run-id", 0, "Run ID")
+	file := fs.String("file", "", "Path to BuildReport JSON")
+	format := fs.String("format", "dot", "Output format: dot|svg")
+	out := fs.String("out", "", "Output path")
+	if err := fs.Parse(args); err != nil {
+		return ExitUsage, err
+	}
+	if strings.TrimSpace(*out) == "" {
+		return ExitUsage, fmt.Errorf("--out is required")
+	}
+
+	runReport, source, err := a.resolveReportSource(ctx, store, *runID, *file)
+	if err != nil {
+		return ExitConfigState, err
+	}
+
+	dot := report.RenderDOT(runReport)
+	formatValue := strings.ToLower(strings.TrimSpace(*format))
+	switch formatValue {
+	case "dot":
+		if err := os.WriteFile(*out, []byte(dot), 0o644); err != nil {
+			return ExitConfigState, fmt.Errorf("write dot export: %w", err)
+		}
+	case "svg":
+		if err := report.RenderSVG(dot, *out); err != nil {
+			return ExitBackend, err
+		}
+	default:
+		return ExitUsage, fmt.Errorf("unsupported export format %q", *format)
+	}
+
+	result := map[string]any{"out": *out, "format": formatValue, "source": source}
+	if global.JSON {
+		if err := output.WriteJSON(a.io.Out, output.SuccessResource("GraphExportReport", "report export", nil, nil, result, runReport.RunID)); err != nil {
+			return ExitInternal, err
+		}
+	} else {
+		_, _ = fmt.Fprintf(a.io.Out, "Exported %s graph to %s\n", formatValue, *out)
+	}
+	return ExitOK, nil
+}
+
+func (a *App) runCI(ctx context.Context, global GlobalOptions, loaded config.Loaded, store *state.Store, args []string) (int, error) {
+	if len(args) == 0 {
+		return ExitUsage, fmt.Errorf("ci subcommand is required")
+	}
+	switch args[0] {
+	case "check":
+		return a.runCICheck(ctx, global, loaded, store, args[1:])
+	case "github-action":
+		return a.runCIGitHubAction(global, args[1:])
+	case "gitlab-ci":
+		return a.runCIGitLab(global, args[1:])
+	default:
+		return ExitUsage, fmt.Errorf("unsupported ci subcommand %q", args[0])
+	}
+}
+
+func (a *App) runCICheck(ctx context.Context, global GlobalOptions, loaded config.Loaded, store *state.Store, args []string) (int, error) {
+	fs := flag.NewFlagSet("ci check", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	baselineSource := fs.String("baseline-source", loaded.Config.CI.BaselineSource, "Baseline source: git|ci-artifact|object-storage")
+	baselineFile := fs.String("baseline-file", loaded.Config.CI.BaselineFile, "Baseline report file")
+	baselineURL := fs.String("baseline-url", loaded.Config.CI.BaselineURL, "Baseline report URL")
+	headRunID := fs.Int64("head-run-id", 0, "Head run ID")
+	headFile := fs.String("head-file", "", "Head report file")
+	thresholds := thresholdFlag{}
+	fs.Var(&thresholds, "threshold", "Threshold override key=value (repeatable)")
+	if err := fs.Parse(args); err != nil {
+		return ExitUsage, err
+	}
+
+	source := strings.TrimSpace(*baselineSource)
+	if source == "" {
+		return ExitUsage, fmt.Errorf("--baseline-source is required")
+	}
+
+	head, headRef, err := a.resolveReportSource(ctx, store, *headRunID, *headFile)
+	if err != nil {
+		return ExitConfigState, fmt.Errorf("resolve head report: %w", err)
+	}
+	base, err := report.LoadBaseline(report.BaselineOptions{Source: source, File: *baselineFile, URL: *baselineURL})
+	if err != nil {
+		return ExitConfigState, err
+	}
+	baseRef := source
+	if *baselineFile != "" {
+		baseRef = *baselineFile
+	}
+	if *baselineURL != "" {
+		baseRef = *baselineURL
+	}
+
+	effectiveThresholds := mergeThresholdMaps(loaded.Config.CI.Thresholds, thresholds)
+	cmp := report.Compare(base, head, effectiveThresholds, baseRef, headRef)
+
+	if global.JSON {
+		spec := map[string]any{"baselineSource": source, "base": baseRef, "head": headRef, "thresholds": effectiveThresholds}
+		phase := "completed"
+		if !cmp.Passed {
+			phase = "failed"
+		}
+		resource := output.Resource{
+			APIVersion: output.APIVersion,
+			Kind:       "CIGateReport",
+			Metadata:   output.ResourceMetadata{Command: "ci check", GeneratedAt: time.Now().UTC()},
+			Spec:       spec,
+			Status: output.ResourceStatus{
+				Phase:   phase,
+				Summary: map[string]any{"passed": cmp.Passed, "regressionCount": len(cmp.Regressions)},
+				Result:  cmp,
+			},
+		}
+		if !cmp.Passed {
+			resource.Status.Errors = []output.ErrorItem{{Code: "regression", Message: strings.Join(cmp.Regressions, "; ")}}
+		}
+		if err := output.WriteJSON(a.io.Out, resource); err != nil {
+			return ExitInternal, err
+		}
+	} else {
+		if err := output.WriteCompareReport(a.io.Out, cmp); err != nil {
+			return ExitInternal, err
+		}
+	}
+
+	if !cmp.Passed {
+		err := fmt.Errorf("ci regression check failed")
+		if global.JSON {
+			return ExitPolicyViolation, markReportedError(err)
+		}
+		return ExitPolicyViolation, err
+	}
+	return ExitOK, nil
+}
+
+func (a *App) runCIGitHubAction(global GlobalOptions, args []string) (int, error) {
+	if len(args) == 0 || args[0] != "init" {
+		return ExitUsage, fmt.Errorf("supported command: ci github-action init")
+	}
+	fs := flag.NewFlagSet("ci github-action init", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	writePath := fs.String("write", "", "Write generated workflow to path")
+	if err := fs.Parse(args[1:]); err != nil {
+		return ExitUsage, err
+	}
+
+	template := strings.TrimSpace(`name: Buildgraph CI
+on:
+  pull_request:
+  push:
+    branches: [main]
+jobs:
+  buildgraph:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25.x"
+      - run: go build ./cmd/buildgraph
+      - run: ./buildgraph analyze run --json > buildgraph-report.json
+      - run: ./buildgraph ci check --baseline-source ci-artifact --baseline-file buildgraph-baseline.json --head-file buildgraph-report.json
+`) + "\n"
+
+	if *writePath != "" {
+		if err := os.MkdirAll(filepath.Dir(*writePath), 0o755); err != nil {
+			return ExitConfigState, fmt.Errorf("create output directory: %w", err)
+		}
+		if err := os.WriteFile(*writePath, []byte(template), 0o644); err != nil {
+			return ExitConfigState, fmt.Errorf("write template: %w", err)
+		}
+	}
+
+	result := map[string]any{"provider": "github", "written": *writePath != "", "path": *writePath, "template": template}
+	if global.JSON {
+		if err := output.WriteJSON(a.io.Out, output.SuccessResource("CIGeneratorReport", "ci github-action init", nil, nil, result, 0)); err != nil {
+			return ExitInternal, err
+		}
+	} else {
+		if *writePath != "" {
+			_, _ = fmt.Fprintf(a.io.Out, "Wrote GitHub Action template to %s\n", *writePath)
+		} else {
+			_, _ = fmt.Fprint(a.io.Out, template)
+		}
+	}
+	return ExitOK, nil
+}
+
+func (a *App) runCIGitLab(global GlobalOptions, args []string) (int, error) {
+	if len(args) == 0 || args[0] != "init" {
+		return ExitUsage, fmt.Errorf("supported command: ci gitlab-ci init")
+	}
+	fs := flag.NewFlagSet("ci gitlab-ci init", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	writePath := fs.String("write", "", "Write generated GitLab CI template to path")
+	if err := fs.Parse(args[1:]); err != nil {
+		return ExitUsage, err
+	}
+
+	template := strings.TrimSpace(`stages:
+  - analyze
+buildgraph_analyze:
+  stage: analyze
+  image: golang:1.25
+  script:
+    - go build ./cmd/buildgraph
+    - ./buildgraph analyze run --json > buildgraph-report.json
+    - ./buildgraph ci check --baseline-source ci-artifact --baseline-file buildgraph-baseline.json --head-file buildgraph-report.json
+  artifacts:
+    when: always
+    paths:
+      - buildgraph-report.json
+`) + "\n"
+
+	if *writePath != "" {
+		if err := os.MkdirAll(filepath.Dir(*writePath), 0o755); err != nil {
+			return ExitConfigState, fmt.Errorf("create output directory: %w", err)
+		}
+		if err := os.WriteFile(*writePath, []byte(template), 0o644); err != nil {
+			return ExitConfigState, fmt.Errorf("write template: %w", err)
+		}
+	}
+
+	result := map[string]any{"provider": "gitlab", "written": *writePath != "", "path": *writePath, "template": template}
+	if global.JSON {
+		if err := output.WriteJSON(a.io.Out, output.SuccessResource("CIGeneratorReport", "ci gitlab-ci init", nil, nil, result, 0)); err != nil {
+			return ExitInternal, err
+		}
+	} else {
+		if *writePath != "" {
+			_, _ = fmt.Fprintf(a.io.Out, "Wrote GitLab CI template to %s\n", *writePath)
+		} else {
+			_, _ = fmt.Fprint(a.io.Out, template)
+		}
 	}
 	return ExitOK, nil
 }
 
 func (a *App) runAuth(global GlobalOptions, args []string) (int, error) {
-	startedAt := time.Now().UTC()
-
 	if len(args) == 0 {
 		return ExitUsage, fmt.Errorf("auth subcommand is required")
 	}
@@ -483,31 +1093,29 @@ func (a *App) runAuth(global GlobalOptions, args []string) (int, error) {
 		if err := manager.Save(auth.Credentials{User: *user, Token: *token}); err != nil {
 			return ExitConfigState, err
 		}
-		return a.writeSimple(global.JSON, "auth login", startedAt, map[string]any{"status": "logged-in", "user": *user})
+		return a.writeSimple(global.JSON, "auth login", "AuthReport", map[string]any{"status": "logged-in", "user": *user})
 	case "logout":
 		if err := manager.Delete(); err != nil {
 			return ExitConfigState, err
 		}
-		return a.writeSimple(global.JSON, "auth logout", startedAt, map[string]any{"status": "logged-out"})
+		return a.writeSimple(global.JSON, "auth logout", "AuthReport", map[string]any{"status": "logged-out"})
 	case "whoami":
 		creds, err := manager.Load()
 		if err != nil {
 			return ExitAuthDenied, fmt.Errorf("not logged in")
 		}
-		return a.writeSimple(global.JSON, "auth whoami", startedAt, map[string]any{"user": creds.User, "source": creds.Source, "storedAt": creds.StoredAt})
+		return a.writeSimple(global.JSON, "auth whoami", "AuthReport", map[string]any{"user": creds.User, "source": creds.Source, "storedAt": creds.StoredAt})
 	default:
 		return ExitUsage, fmt.Errorf("unsupported auth subcommand %q", subcommand)
 	}
 }
 
 func (a *App) runConfig(global GlobalOptions, loaded config.Loaded, args []string) (int, error) {
-	startedAt := time.Now().UTC()
-
 	if len(args) == 0 || args[0] != "show" {
 		return ExitUsage, fmt.Errorf("supported config command: show")
 	}
 	if global.JSON {
-		return ExitOK, output.WriteJSON(a.io.Out, output.NewEnvelope("config show", startedAt, loaded, nil))
+		return ExitOK, output.WriteJSON(a.io.Out, output.SuccessResource("ConfigReport", "config show", nil, nil, loaded, 0))
 	}
 
 	fmt.Fprintf(a.io.Out, "Global config: %s\n", loaded.Paths.GlobalPath)
@@ -519,19 +1127,17 @@ func (a *App) runConfig(global GlobalOptions, loaded config.Loaded, args []strin
 }
 
 func (a *App) runVersion(global GlobalOptions) (int, error) {
-	startedAt := time.Now().UTC()
-
 	payload := map[string]any{
 		"version":   version.Version,
 		"commit":    version.Commit,
 		"buildDate": version.BuildDate,
 	}
-	return a.writeSimple(global.JSON, "version", startedAt, payload)
+	return a.writeSimple(global.JSON, "version", "VersionReport", payload)
 }
 
-func (a *App) writeSimple(asJSON bool, command string, startedAt time.Time, result any) (int, error) {
+func (a *App) writeSimple(asJSON bool, command, kind string, result any) (int, error) {
 	if asJSON {
-		if err := output.WriteJSON(a.io.Out, output.NewEnvelope(command, startedAt, result, nil)); err != nil {
+		if err := output.WriteJSON(a.io.Out, output.SuccessResource(kind, command, nil, nil, result, 0)); err != nil {
 			return ExitInternal, err
 		}
 	} else {
@@ -547,6 +1153,62 @@ func (a *App) writeSimple(asJSON bool, command string, startedAt time.Time, resu
 		}
 	}
 	return ExitOK, nil
+}
+
+func (a *App) resolveReportSource(ctx context.Context, store *state.Store, runID int64, file string) (report.BuildReport, string, error) {
+	if runID > 0 {
+		if store == nil {
+			return report.BuildReport{}, "", fmt.Errorf("state store unavailable")
+		}
+		rec, err := store.GetReportByRunID(ctx, runID)
+		if err != nil {
+			return report.BuildReport{}, "", err
+		}
+		runReport, err := report.ParseBuildReportJSON([]byte(rec.ReportJSON))
+		if err != nil {
+			return report.BuildReport{}, "", err
+		}
+		runReport.RunID = rec.RunID
+		return runReport, fmt.Sprintf("run:%d", runID), nil
+	}
+	if strings.TrimSpace(file) != "" {
+		runReport, err := report.ReadBuildReportFile(file)
+		if err != nil {
+			return report.BuildReport{}, "", err
+		}
+		return runReport, file, nil
+	}
+	if store == nil {
+		return report.BuildReport{}, "", fmt.Errorf("state store unavailable")
+	}
+	rec, err := store.GetLatestReport(ctx)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return report.BuildReport{}, "", fmt.Errorf("no reports available in state store")
+		}
+		return report.BuildReport{}, "", err
+	}
+	runReport, err := report.ParseBuildReportJSON([]byte(rec.ReportJSON))
+	if err != nil {
+		return report.BuildReport{}, "", err
+	}
+	runReport.RunID = rec.RunID
+	return runReport, fmt.Sprintf("run:%d", rec.RunID), nil
+}
+
+func (a *App) resolveReportNamedSource(ctx context.Context, store *state.Store, source string) (report.BuildReport, string, error) {
+	source = strings.TrimSpace(source)
+	if strings.HasPrefix(source, "run:") {
+		value := strings.TrimPrefix(source, "run:")
+		runID, err := strconv.ParseInt(value, 10, 64)
+		if err != nil {
+			return report.BuildReport{}, "", fmt.Errorf("invalid run source %q", source)
+		}
+		runReport, _, err := a.resolveReportSource(ctx, store, runID, "")
+		return runReport, source, err
+	}
+	runReport, _, err := a.resolveReportSource(ctx, store, 0, source)
+	return runReport, source, err
 }
 
 func (a *App) resolveBackend(requested string) (backend.Backend, error) {
@@ -714,6 +1376,21 @@ func normalizeSeverity(value string) string {
 	}
 }
 
+func normalizeProgressMode(value string, globalJSON bool) (string, error) {
+	mode := strings.ToLower(strings.TrimSpace(value))
+	switch mode {
+	case "", "auto":
+		if globalJSON {
+			return "none", nil
+		}
+		return "human", nil
+	case "human", "json", "none":
+		return mode, nil
+	default:
+		return "", fmt.Errorf("invalid progress mode %q", value)
+	}
+}
+
 func errString(err error) string {
 	if err == nil {
 		return ""
@@ -726,54 +1403,6 @@ func status(ok bool, detail string) string {
 		return "ok: " + detail
 	}
 	return "missing: " + detail
-}
-
-func normalizeProgressMode(value string, globalJSON bool) (string, error) {
-	mode := strings.ToLower(strings.TrimSpace(value))
-	switch mode {
-	case "", "auto":
-		if globalJSON {
-			return "none", nil
-		}
-		return "human", nil
-	case "human", "json", "none":
-		return mode, nil
-	default:
-		return "", fmt.Errorf("invalid --progress %q (expected human|json|none)", value)
-	}
-}
-
-func doctorConfigSnippet(configEndpoint, detectedEndpoint string) string {
-	endpoint := strings.TrimSpace(detectedEndpoint)
-	if endpoint == "" {
-		endpoint = strings.TrimSpace(configEndpoint)
-	}
-	if endpoint == "" {
-		endpoint = "unix:///run/buildkit/buildkitd.sock"
-	}
-	return fmt.Sprintf("backend: buildkit\nendpoint: %q\n", endpoint)
-}
-
-func doctorCommonFixes(configEndpoint string, detect backend.DetectResult) []string {
-	fixes := []string{
-		"If using a direct BuildKit socket, verify buildkitd is running and your user can access the socket path.",
-		"If using Docker Desktop/Engine, confirm the daemon is reachable and the active Docker context matches your expected environment.",
-		"If endpoint detection is wrong, pin backend and endpoint in .buildgraph.yaml to avoid ambiguous auto-detection.",
-	}
-
-	if strings.TrimSpace(configEndpoint) != "" {
-		fixes = append(fixes, fmt.Sprintf("Configured endpoint is %q; remove conflicting BUILDGRAPH_ENDPOINT or BUILDKIT_HOST values if they should not override config.", configEndpoint))
-	}
-	if source := detect.Metadata["resolutionSource"]; source == "env" {
-		fixes = append(fixes, "Detection resolved from environment; clear BUILDKIT_HOST if this endpoint is stale.")
-	}
-	for _, attempt := range detect.Attempts {
-		if strings.Contains(strings.ToLower(attempt.Error), "permission denied") {
-			fixes = append(fixes, "Permission denied was reported while probing BuildKit. Add your user to the required group or adjust socket ACLs.")
-			break
-		}
-	}
-	return fixes
 }
 
 type stringSliceFlag []string
@@ -843,15 +1472,61 @@ func parseSecrets(values kvSliceFlag) []backend.SecretSpec {
 	return secrets
 }
 
-func (a *App) writeError(asJSON bool, command string, durationMs int64, err error) {
+type thresholdFlag map[string]float64
+
+func (t *thresholdFlag) String() string {
+	if t == nil {
+		return ""
+	}
+	keys := make([]string, 0, len(*t))
+	for key := range *t {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	parts := make([]string, 0, len(keys))
+	for _, key := range keys {
+		parts = append(parts, fmt.Sprintf("%s=%v", key, (*t)[key]))
+	}
+	return strings.Join(parts, ",")
+}
+
+func (t *thresholdFlag) Set(value string) error {
+	if *t == nil {
+		*t = map[string]float64{}
+	}
+	parts := strings.SplitN(strings.TrimSpace(value), "=", 2)
+	if len(parts) != 2 {
+		return fmt.Errorf("threshold must be key=value")
+	}
+	parsed, err := strconv.ParseFloat(strings.TrimSpace(parts[1]), 64)
+	if err != nil {
+		return fmt.Errorf("invalid threshold value %q", parts[1])
+	}
+	(*t)[strings.TrimSpace(parts[0])] = parsed
+	return nil
+}
+
+func mergeThresholdMaps(base map[string]float64, overrides map[string]float64) map[string]float64 {
+	result := map[string]float64{}
+	for key, value := range report.DefaultThresholds() {
+		result[key] = value
+	}
+	for key, value := range base {
+		result[key] = value
+	}
+	for key, value := range overrides {
+		result[key] = value
+	}
+	return result
+}
+
+func (a *App) writeError(asJSON bool, command string, err error) {
 	if err == nil {
 		return
 	}
 	if asJSON {
-		_ = output.WriteJSON(a.io.Err, output.NewEnvelopeWithDuration(command, durationMs, nil, []output.ErrorItem{{
-			Code:    "error",
-			Message: err.Error(),
-		}}))
+		resource := output.ErrorResource("ErrorReport", command, nil, nil, []output.ErrorItem{{Code: "error", Message: err.Error()}}, 0)
+		_ = output.WriteJSON(a.io.Err, resource)
 		return
 	}
 	fmt.Fprintf(a.io.Err, "Error: %v\n", err)
@@ -864,24 +1539,31 @@ func (a *App) printHelp(w io.Writer) {
 	fmt.Fprintln(w, "  buildgraph [global flags] <command> [command flags]")
 	fmt.Fprintln(w, "")
 	fmt.Fprintln(w, "Commands:")
-	fmt.Fprintln(w, "  analyze       Analyze Dockerfile and build context")
-	fmt.Fprintln(w, "  build         Execute BuildKit build (--progress, --trace)")
-	fmt.Fprintln(w, "  graph         Build graph artifact from trace (--from, --format, --output)")
-	fmt.Fprintln(w, "  top           Show slowest vertices and critical path from trace")
-	fmt.Fprintln(w, "  backend list  List available backends")
-	fmt.Fprintln(w, "  doctor        Run environment diagnostics")
-	fmt.Fprintln(w, "  auth          Manage SaaS authentication state")
-	fmt.Fprintln(w, "  config show   Show effective config")
-	fmt.Fprintln(w, "  version       Print version information")
+	fmt.Fprintln(w, "  analyze              Analyze Dockerfile and build context")
+	fmt.Fprintln(w, "  analyze run          Execute build and emit BuildReport")
+	fmt.Fprintln(w, "  build                Execute BuildKit build")
+	fmt.Fprintln(w, "  report show          Show BuildReport")
+	fmt.Fprintln(w, "  report metrics       Show BuildReport metrics")
+	fmt.Fprintln(w, "  report compare       Compare BuildReports")
+	fmt.Fprintln(w, "  report trend         Show trend across recent BuildReports")
+	fmt.Fprintln(w, "  report export        Export BuildReport graph to DOT/SVG")
+	fmt.Fprintln(w, "  ci check             Evaluate CI regression policy")
+	fmt.Fprintln(w, "  ci github-action     Generate GitHub Action template")
+	fmt.Fprintln(w, "  ci gitlab-ci         Generate GitLab CI template")
+	fmt.Fprintln(w, "  backend list         List available backends")
+	fmt.Fprintln(w, "  doctor               Run environment diagnostics")
+	fmt.Fprintln(w, "  auth                 Manage SaaS authentication state")
+	fmt.Fprintln(w, "  config show          Show effective config")
+	fmt.Fprintln(w, "  version              Print version information")
 	fmt.Fprintln(w, "")
 	fmt.Fprintln(w, "Global Flags:")
-	fmt.Fprintln(w, "  --json             Render JSON output")
-	fmt.Fprintln(w, "  --no-color         Disable color")
-	fmt.Fprintln(w, "  --verbose          Verbose mode")
-	fmt.Fprintln(w, "  --config PATH      Global config path")
+	fmt.Fprintln(w, "  --json                 Render JSON output (buildgraph.dev/v2)")
+	fmt.Fprintln(w, "  --no-color             Disable color")
+	fmt.Fprintln(w, "  --verbose              Verbose mode")
+	fmt.Fprintln(w, "  --config PATH          Global config path")
 	fmt.Fprintln(w, "  --project-config PATH  Project config path")
-	fmt.Fprintln(w, "  --profile NAME     Config profile")
-	fmt.Fprintln(w, "  --non-interactive  Disable prompts")
+	fmt.Fprintln(w, "  --profile NAME         Config profile")
+	fmt.Fprintln(w, "  --non-interactive      Disable prompts")
 }
 
 type reportedError struct {

@@ -95,6 +95,38 @@ type CacheStats struct {
 	Misses int `json:"misses"`
 }
 
+type BuildVertex struct {
+	ID          string     `json:"id"`
+	Name        string     `json:"name"`
+	Stage       string     `json:"stage,omitempty"`
+	StartedAt   *time.Time `json:"startedAt,omitempty"`
+	CompletedAt *time.Time `json:"completedAt,omitempty"`
+	DurationMS  int64      `json:"durationMs"`
+	Cached      bool       `json:"cached"`
+}
+
+type BuildEdge struct {
+	From string `json:"from"`
+	To   string `json:"to"`
+}
+
+type SlowVertex struct {
+	ID         string `json:"id"`
+	Name       string `json:"name"`
+	DurationMS int64  `json:"durationMs"`
+}
+
+type BuildMetrics struct {
+	CriticalPathMS       int64            `json:"criticalPathMs"`
+	CriticalPathVertices []string         `json:"criticalPathVertices"`
+	CacheHitRatio        float64          `json:"cacheHitRatio"`
+	StageDistribution    map[string]int64 `json:"stageDistribution"`
+	TimeDistribution     map[string]int64 `json:"timeDistribution"`
+	LongestChain         int              `json:"longestChain"`
+	TopSlowVertices      []SlowVertex     `json:"topSlowVertices,omitempty"`
+	RepeatedMissPatterns []string         `json:"repeatedMissPatterns,omitempty"`
+}
+
 type BuildResult struct {
 	Backend             string            `json:"backend"`
 	Endpoint            string            `json:"endpoint"`
@@ -102,6 +134,9 @@ type BuildResult struct {
 	Digest              string            `json:"digest"`
 	ProvenanceAvailable bool              `json:"provenanceAvailable"`
 	CacheStats          CacheStats        `json:"cacheStats"`
+	Vertices            []BuildVertex     `json:"vertices,omitempty"`
+	Edges               []BuildEdge       `json:"edges,omitempty"`
+	GraphComplete       bool              `json:"graphComplete"`
 	Warnings            []string          `json:"warnings"`
 	ExporterResponse    map[string]string `json:"-"`
 }

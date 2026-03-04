@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -99,8 +100,8 @@ func (d *DirectDriver) Build(ctx context.Context, endpoint string, req backend.B
 	}
 
 	statusCh := make(chan *bkclient.SolveStatus)
-	var cacheHits int
-	var cacheMisses int
+	vertexByID := map[string]backend.BuildVertex{}
+	edgeSet := map[string]backend.BuildEdge{}
 
 	progressCtx, cancelProgress := context.WithCancel(ctx)
 	defer cancelProgress()
@@ -118,14 +119,71 @@ func (d *DirectDriver) Build(ctx context.Context, endpoint string, req backend.B
 					if vertex == nil {
 						continue
 					}
-					if vertex.Cached {
-						cacheHits++
-					} else {
-						cacheMisses++
+					vertexID := vertex.Digest.String()
+					if vertexID == "" {
+						continue
+					}
+					snapshot := vertexByID[vertexID]
+					snapshot.ID = vertexID
+					if vertex.Name != "" {
+						snapshot.Name = vertex.Name
+						snapshot.Stage = extractStageFromVertexName(vertex.Name)
+					}
+					snapshot.Cached = snapshot.Cached || vertex.Cached
+					if vertex.Started != nil {
+						started := vertex.Started.UTC()
+						snapshot.StartedAt = &started
+					}
+					if vertex.Completed != nil {
+						completed := vertex.Completed.UTC()
+						snapshot.CompletedAt = &completed
+					}
+					vertexByID[vertexID] = snapshot
+
+					for _, input := range vertex.Inputs {
+						from := input.String()
+						if from == "" || from == vertexID {
+							continue
+						}
+						key := from + "->" + vertexID
+						edgeSet[key] = backend.BuildEdge{From: from, To: vertexID}
+					}
+
+					state := "running"
+					if vertex.Completed != nil {
+						state = "completed"
 					}
 					if progressFn != nil {
-						progressFn(toBuildProgressEvent(vertex))
+						event := toBuildProgressEvent(vertex)
+						event.Status = state
+						progressFn(event)
 					}
+				}
+				for _, statusEntry := range status.Statuses {
+					if statusEntry == nil {
+						continue
+					}
+					vertexID := statusEntry.Vertex.String()
+					if vertexID == "" {
+						continue
+					}
+					snapshot := vertexByID[vertexID]
+					snapshot.ID = vertexID
+					if statusEntry.Name != "" && snapshot.Name == "" {
+						snapshot.Name = statusEntry.Name
+					}
+					if statusEntry.Started != nil {
+						started := statusEntry.Started.UTC()
+						snapshot.StartedAt = &started
+					}
+					if statusEntry.Completed != nil {
+						completed := statusEntry.Completed.UTC()
+						snapshot.CompletedAt = &completed
+					}
+					if snapshot.Stage == "" {
+						snapshot.Stage = extractStageFromVertexName(snapshot.Name)
+					}
+					vertexByID[vertexID] = snapshot
 				}
 			}
 		}
@@ -148,6 +206,38 @@ func (d *DirectDriver) Build(ctx context.Context, endpoint string, req backend.B
 		digest = response.ExporterResponse["containerimage.config.digest"]
 	}
 
+	vertices := make([]backend.BuildVertex, 0, len(vertexByID))
+	cacheHits := 0
+	cacheMisses := 0
+	for _, vertex := range vertexByID {
+		if vertex.StartedAt != nil && vertex.CompletedAt != nil {
+			vertex.DurationMS = vertex.CompletedAt.Sub(*vertex.StartedAt).Milliseconds()
+			if vertex.DurationMS < 0 {
+				vertex.DurationMS = 0
+			}
+		}
+		if vertex.Cached {
+			cacheHits++
+		} else {
+			cacheMisses++
+		}
+		vertices = append(vertices, vertex)
+	}
+	sort.Slice(vertices, func(i, j int) bool {
+		return vertices[i].ID < vertices[j].ID
+	})
+
+	edges := make([]backend.BuildEdge, 0, len(edgeSet))
+	for _, edge := range edgeSet {
+		edges = append(edges, edge)
+	}
+	sort.Slice(edges, func(i, j int) bool {
+		if edges[i].From == edges[j].From {
+			return edges[i].To < edges[j].To
+		}
+		return edges[i].From < edges[j].From
+	})
+
 	return backend.BuildResult{
 		Outputs:             outputs,
 		Digest:              digest,
@@ -156,6 +246,9 @@ func (d *DirectDriver) Build(ctx context.Context, endpoint string, req backend.B
 			Hits:   cacheHits,
 			Misses: cacheMisses,
 		},
+		Vertices:         vertices,
+		Edges:            edges,
+		GraphComplete:    len(vertices) > 0,
 		Warnings:         warnings,
 		ExporterResponse: response.ExporterResponse,
 	}, nil
@@ -196,6 +289,26 @@ func toBuildProgressEvent(vertex *bkclient.Vertex) backend.BuildProgressEvent {
 	event.Cached = vertex.Cached
 	event.Error = vertex.Error
 	return event
+}
+
+func extractStageFromVertexName(name string) string {
+	name = strings.TrimSpace(name)
+	if !strings.HasPrefix(name, "[") {
+		return ""
+	}
+	end := strings.Index(name, "]")
+	if end <= 1 {
+		return ""
+	}
+	inside := strings.TrimSpace(name[1:end])
+	if inside == "" {
+		return ""
+	}
+	parts := strings.Fields(inside)
+	if len(parts) == 0 {
+		return ""
+	}
+	return parts[0]
 }
 
 func configureExports(solveOpt *bkclient.SolveOpt, req backend.BuildRequest) ([]string, []string, error) {

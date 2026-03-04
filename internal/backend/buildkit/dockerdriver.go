@@ -127,6 +127,11 @@ func (d *DockerDriver) Build(ctx context.Context, req backend.BuildRequest, prog
 
 	decoder := json.NewDecoder(response.Body)
 	warnings := make([]string, 0)
+	vertices := make([]backend.BuildVertex, 0, 64)
+	edges := make([]backend.BuildEdge, 0, 63)
+	var previousVertexID string
+	cacheHits := 0
+	cacheMisses := 0
 	for decoder.More() {
 		var msg dockerBuildMessage
 		if err := decoder.Decode(&msg); err != nil {
@@ -153,6 +158,29 @@ func (d *DockerDriver) Build(ctx context.Context, req backend.BuildRequest, prog
 		if strings.Contains(strings.ToLower(text), "warning") {
 			warnings = append(warnings, text)
 		}
+		if text != "" {
+			now := time.Now().UTC()
+			vertexID := fmt.Sprintf("docker-%06d", len(vertices)+1)
+			cached := strings.Contains(strings.ToLower(text), "cached")
+			if cached {
+				cacheHits++
+			} else {
+				cacheMisses++
+			}
+			vertices = append(vertices, backend.BuildVertex{
+				ID:          vertexID,
+				Name:        text,
+				Stage:       extractStageFromVertexName(text),
+				StartedAt:   &now,
+				CompletedAt: &now,
+				DurationMS:  0,
+				Cached:      cached,
+			})
+			if previousVertexID != "" {
+				edges = append(edges, backend.BuildEdge{From: previousVertexID, To: vertexID})
+			}
+			previousVertexID = vertexID
+		}
 	}
 
 	inspect, err := cli.ImageInspect(ctx, req.ImageRef)
@@ -164,10 +192,13 @@ func (d *DockerDriver) Build(ctx context.Context, req backend.BuildRequest, prog
 		Outputs: []string{req.ImageRef},
 		Digest:  inspect.ID,
 		CacheStats: backend.CacheStats{
-			Hits:   0,
-			Misses: 0,
+			Hits:   cacheHits,
+			Misses: cacheMisses,
 		},
-		Warnings: warnings,
+		Vertices:      vertices,
+		Edges:         edges,
+		GraphComplete: false,
+		Warnings:      warnings,
 	}, nil
 }
 
