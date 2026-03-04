@@ -553,6 +553,14 @@ func (a *App) runDoctor(ctx context.Context, global GlobalOptions, loaded config
 		"config.global":  status(loaded.Paths.GlobalExists, loaded.Paths.GlobalPath),
 		"config.project": status(loaded.Paths.ProjectExists, loaded.Paths.ProjectPath),
 	}
+	doctorReport := output.DoctorReport{
+		Checks: checks,
+		CommonFixes: []string{
+			"Set --endpoint or BUILDKIT_HOST to a reachable BuildKit daemon.",
+			"Run buildkitd locally or start Docker Desktop with BuildKit enabled.",
+			"Set ci.baselineSource with matching baselineFile/baselineUrl in config for CI checks.",
+		},
+	}
 	if store != nil {
 		checks["state.sqlite"] = "ok: " + store.Path()
 	} else {
@@ -573,6 +581,9 @@ func (a *App) runDoctor(ctx context.Context, global GlobalOptions, loaded config
 			checks["backend.detect"] = "error: " + detectErr.Error()
 		} else {
 			checks["backend.detect"] = fmt.Sprintf("ok: mode=%s endpoint=%s", detect.Mode, detect.Endpoint)
+			doctorReport.Found = detect
+			doctorReport.Attempts = detect.Attempts
+			doctorReport.ConfigSnippet = fmt.Sprintf("backend: buildkit\nendpoint: %q\n", detect.Endpoint)
 		}
 	}
 
@@ -606,11 +617,11 @@ func (a *App) runDoctor(ctx context.Context, global GlobalOptions, loaded config
 
 	summary := map[string]any{"checkCount": len(checks)}
 	if global.JSON {
-		if err := output.WriteJSON(a.io.Out, output.SuccessResource("DoctorReport", "doctor", nil, summary, map[string]any{"checks": checks}, 0)); err != nil {
+		if err := output.WriteJSON(a.io.Out, output.SuccessResource("DoctorReport", "doctor", nil, summary, doctorReport, 0)); err != nil {
 			return ExitInternal, err
 		}
 	} else {
-		if err := output.WriteDoctor(a.io.Out, checks); err != nil {
+		if err := output.WriteDoctor(a.io.Out, doctorReport); err != nil {
 			return ExitInternal, err
 		}
 	}
@@ -1362,6 +1373,21 @@ func normalizeSeverity(value string) string {
 		return s
 	default:
 		return backend.SeverityLow
+	}
+}
+
+func normalizeProgressMode(value string, globalJSON bool) (string, error) {
+	mode := strings.ToLower(strings.TrimSpace(value))
+	switch mode {
+	case "", "auto":
+		if globalJSON {
+			return "none", nil
+		}
+		return "human", nil
+	case "human", "json", "none":
+		return mode, nil
+	default:
+		return "", fmt.Errorf("invalid progress mode %q", value)
 	}
 }
 
