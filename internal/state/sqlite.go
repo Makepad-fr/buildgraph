@@ -27,6 +27,13 @@ type RunRecord struct {
 	ErrorText  string
 }
 
+type ReportRecord struct {
+	RunID      int64
+	Kind       string
+	ReportJSON string
+	CreatedAt  time.Time
+}
+
 func Open(path string) (*Store, error) {
 	if path == "" {
 		return nil, fmt.Errorf("state db path is required")
@@ -103,6 +110,15 @@ func (s *Store) init(ctx context.Context) error {
 			created_at TEXT NOT NULL,
 			FOREIGN KEY(run_id) REFERENCES runs(id)
 		);`,
+		`CREATE TABLE IF NOT EXISTS reports (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			run_id INTEGER NOT NULL UNIQUE,
+			kind TEXT NOT NULL,
+			report_json TEXT NOT NULL,
+			created_at TEXT NOT NULL,
+			FOREIGN KEY(run_id) REFERENCES runs(id)
+		);`,
+		`CREATE INDEX IF NOT EXISTS idx_reports_created_at ON reports(created_at DESC);`,
 	}
 
 	for _, stmt := range stmts {
@@ -215,6 +231,85 @@ func (s *Store) RecordEvent(ctx context.Context, runID int64, name string, paylo
 		return fmt.Errorf("insert event: %w", err)
 	}
 	return nil
+}
+
+func (s *Store) RecordReport(ctx context.Context, runID int64, kind string, report any) error {
+	if runID <= 0 {
+		return fmt.Errorf("run id must be greater than zero")
+	}
+	if kind == "" {
+		kind = "BuildReport"
+	}
+	payload, err := json.Marshal(report)
+	if err != nil {
+		return fmt.Errorf("marshal report: %w", err)
+	}
+	_, err = s.db.ExecContext(ctx,
+		`INSERT INTO reports(run_id, kind, report_json, created_at) VALUES(?, ?, ?, ?)
+		 ON CONFLICT(run_id) DO UPDATE SET kind=excluded.kind, report_json=excluded.report_json, created_at=excluded.created_at`,
+		runID,
+		kind,
+		string(payload),
+		time.Now().UTC().Format(time.RFC3339),
+	)
+	if err != nil {
+		return fmt.Errorf("insert report: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) GetReportByRunID(ctx context.Context, runID int64) (ReportRecord, error) {
+	row := s.db.QueryRowContext(ctx, `SELECT run_id, kind, report_json, created_at FROM reports WHERE run_id = ?`, runID)
+	return scanReportRecord(row)
+}
+
+func (s *Store) GetLatestReport(ctx context.Context) (ReportRecord, error) {
+	row := s.db.QueryRowContext(ctx, `SELECT run_id, kind, report_json, created_at FROM reports ORDER BY created_at DESC LIMIT 1`)
+	return scanReportRecord(row)
+}
+
+func (s *Store) ListRecentReports(ctx context.Context, limit int) ([]ReportRecord, error) {
+	if limit <= 0 {
+		limit = 10
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT run_id, kind, report_json, created_at FROM reports ORDER BY created_at DESC LIMIT ?`, limit)
+	if err != nil {
+		return nil, fmt.Errorf("query reports: %w", err)
+	}
+	defer rows.Close()
+
+	reports := make([]ReportRecord, 0, limit)
+	for rows.Next() {
+		var rec ReportRecord
+		var createdAt string
+		if err := rows.Scan(&rec.RunID, &rec.Kind, &rec.ReportJSON, &createdAt); err != nil {
+			return nil, fmt.Errorf("scan report row: %w", err)
+		}
+		if ts, err := time.Parse(time.RFC3339, createdAt); err == nil {
+			rec.CreatedAt = ts.UTC()
+		}
+		reports = append(reports, rec)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate reports: %w", err)
+	}
+	return reports, nil
+}
+
+type reportScanner interface {
+	Scan(dest ...any) error
+}
+
+func scanReportRecord(scanner reportScanner) (ReportRecord, error) {
+	var rec ReportRecord
+	var createdAt string
+	if err := scanner.Scan(&rec.RunID, &rec.Kind, &rec.ReportJSON, &createdAt); err != nil {
+		return ReportRecord{}, fmt.Errorf("scan report: %w", err)
+	}
+	if ts, err := time.Parse(time.RFC3339, createdAt); err == nil {
+		rec.CreatedAt = ts.UTC()
+	}
+	return rec, nil
 }
 
 func boolToInt(v bool) int {

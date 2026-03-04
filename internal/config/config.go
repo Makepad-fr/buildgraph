@@ -7,6 +7,7 @@ type Config struct {
 	Endpoint  string                   `yaml:"endpoint" json:"endpoint"`
 	Telemetry TelemetryConfig          `yaml:"telemetry" json:"telemetry"`
 	Auth      AuthConfig               `yaml:"auth" json:"auth"`
+	CI        CIConfig                 `yaml:"ci" json:"ci"`
 	Defaults  DefaultsConfig           `yaml:"defaults" json:"defaults"`
 	Profiles  map[string]ProfileConfig `yaml:"profiles" json:"profiles"`
 }
@@ -19,6 +20,13 @@ type TelemetryConfig struct {
 type AuthConfig struct {
 	Endpoint string `yaml:"endpoint" json:"endpoint"`
 	User     string `yaml:"user" json:"user"`
+}
+
+type CIConfig struct {
+	BaselineSource string             `yaml:"baselineSource" json:"baselineSource"`
+	BaselineFile   string             `yaml:"baselineFile" json:"baselineFile"`
+	BaselineURL    string             `yaml:"baselineUrl" json:"baselineUrl"`
+	Thresholds     map[string]float64 `yaml:"thresholds" json:"thresholds"`
 }
 
 type DefaultsConfig struct {
@@ -79,6 +87,15 @@ func DefaultConfig() Config {
 				Dockerfile: "Dockerfile",
 				OutputMode: "image",
 				ImageRef:   "",
+			},
+		},
+		CI: CIConfig{
+			Thresholds: map[string]float64{
+				"duration_total_pct":      10,
+				"critical_path_pct":       10,
+				"cache_hit_ratio_pp_drop": 10,
+				"cache_miss_count_pct":    15,
+				"warning_count_delta":     0,
 			},
 		},
 		Profiles: map[string]ProfileConfig{},
